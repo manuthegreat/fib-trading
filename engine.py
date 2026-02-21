@@ -500,9 +500,11 @@ def build_hourly_entries(
     hourly_df,
     pivot_look=5,
     min_hh_count=2,
-    min_pullback_pct=0.007,
+    min_pullback_pct=0.002,
+    max_pullback_pct=0.12,
     near_entry_tol=0.02,
     max_bars_after_low=320,
+    min_bars_since_high=3,
 ):
     """
     Build hourly entry candidates from DAILY-qualified tickers (combined/List A).
@@ -531,8 +533,10 @@ def build_hourly_entries(
     entries = []
     rejects = []
 
-    # Kept for signature stability; hourly inclusion no longer depends on entry proximity.
+    # Kept for signature stability; hourly inclusion no longer depends on these checks.
     _ = near_entry_tol
+    _ = pivot_look
+    _ = min_hh_count
 
     hourly = hourly_df.copy()
     hourly["DateTime"] = pd.to_datetime(hourly["DateTime"])
@@ -556,59 +560,50 @@ def build_hourly_entries(
         if len(after_low) > max_bars_after_low:
             after_low = after_low.tail(max_bars_after_low).copy()
 
-        highs = after_low["High"].to_numpy()
-        pivots = _hourly_pivot_high_indices(highs, look=pivot_look)
-
-        if len(pivots) < min_hh_count:
-            rejects.append({"Ticker": ticker, "RejectReason": "not_enough_pivot_highs"})
+        if len(after_low) <= min_bars_since_high:
+            rejects.append({"Ticker": ticker, "RejectReason": "high_too_recent"})
             continue
 
-        pivot_high_values = [float(after_low.iloc[i]["High"]) for i in pivots]
-        pivot_times = [pd.to_datetime(after_low.iloc[i]["DateTime"]) for i in pivots]
-
-        selected_idxs = None
-        for end in range(len(pivots), min_hh_count - 1, -1):
-            candidate = pivots[end - min_hh_count : end]
-            candidate_highs = [float(after_low.iloc[i]["High"]) for i in candidate]
-            if all(x < y for x, y in zip(candidate_highs, candidate_highs[1:])):
-                selected_idxs = candidate
-                break
-
-        if selected_idxs is None:
-            rejects.append({"Ticker": ticker, "RejectReason": "highs_not_rising"})
+        eligible = after_low.iloc[:-min_bars_since_high]
+        if eligible.empty:
+            rejects.append({"Ticker": ticker, "RejectReason": "high_too_recent"})
             continue
 
-        local_idx = selected_idxs[-1]
-        local_high = float(after_low.iloc[local_idx]["High"])
-        local_high_time = pd.to_datetime(after_low.iloc[local_idx]["DateTime"])
-
-        if not (local_high_time > retr_low_date):
-            rejects.append({"Ticker": ticker, "RejectReason": "local_high_not_after_daily_low"})
-            continue
+        local_idx = eligible["High"].idxmax()
+        local_high = float(eligible.loc[local_idx, "High"])
+        local_high_time = pd.to_datetime(eligible.loc[local_idx, "DateTime"])
 
         last_bar = after_low.iloc[-1]
         last_close = float(last_bar["Close"])
         last_low = float(last_bar["Low"])
         last_high = float(last_bar["High"])
 
-        pullback_pct = (local_high - last_close) / local_high
-        retracing_now = (last_close < local_high) and (pullback_pct >= min_pullback_pct)
+        bars_since_high = int((after_low["DateTime"] > local_high_time).sum())
+
+        retrace_from_high_pct = (local_high - last_close) / local_high
+        retracing_now = (
+            (last_close < local_high)
+            and (retrace_from_high_pct >= min_pullback_pct)
+            and (retrace_from_high_pct <= max_pullback_pct)
+        )
         if not retracing_now:
             rejects.append({"Ticker": ticker, "RejectReason": "no_pullback"})
             continue
 
         fib_low = retr_low_price
         fib_high = local_high
-        entry = fib_high - 0.618 * (fib_high - fib_low)
+        entry_382 = fib_high - 0.382 * (fib_high - fib_low)
+        entry_50 = fib_high - 0.50 * (fib_high - fib_low)
+        entry_618 = fib_high - 0.618 * (fib_high - fib_low)
         stop = fib_low
         take_profit = fib_high
 
-        if not (stop < entry < take_profit):
+        if not (stop < entry_618 < take_profit):
             rejects.append({"Ticker": ticker, "RejectReason": "invalid_trade_levels"})
             continue
 
-        distance_to_entry_pct = (last_close - entry) / entry
-        entry_hit = (last_low <= entry) and (entry <= last_high)
+        distance_to_entry_618_pct = (last_close - entry_618) / entry_618
+        entry_618_hit = (last_low <= entry_618) and (entry_618 <= last_high)
 
         entries.append(
             {
@@ -617,17 +612,18 @@ def build_hourly_entries(
                 "DailyRetrLowPrice": fib_low,
                 "local_high_time": local_high_time,
                 "local_high": fib_high,
-                "entry": entry,
+                "entry_382": entry_382,
+                "entry_50": entry_50,
+                "entry_618": entry_618,
                 "stop": stop,
                 "take_profit": take_profit,
                 "last_close": last_close,
-                "pullback_pct": pullback_pct,
-                "distance_to_entry_pct": distance_to_entry_pct,
-                "entry_hit": bool(entry_hit),
-                "retracing_now": bool(retracing_now),
-                "HH_count_used": min_hh_count,
-                "pivot_high_times": [t.isoformat() for t in pivot_times],
-                "pivot_high_values": pivot_high_values,
+                "last_low": last_low,
+                "last_high": last_high,
+                "retrace_from_high_pct": retrace_from_high_pct,
+                "bars_since_high": bars_since_high,
+                "distance_to_entry_618_pct": distance_to_entry_618_pct,
+                "entry_618_hit": bool(entry_618_hit),
             }
         )
 
@@ -635,11 +631,11 @@ def build_hourly_entries(
     rejects_df = pd.DataFrame(rejects)
 
     if not entries_df.empty:
-        entries_df["abs_distance_to_entry_pct"] = entries_df["distance_to_entry_pct"].abs()
+        entries_df["abs_distance_to_entry_618_pct"] = entries_df["distance_to_entry_618_pct"].abs()
         entries_df = entries_df.sort_values(
-            by=["entry_hit", "abs_distance_to_entry_pct", "pullback_pct"],
+            by=["entry_618_hit", "abs_distance_to_entry_618_pct", "retrace_from_high_pct"],
             ascending=[False, True, False],
-        ).drop(columns=["abs_distance_to_entry_pct"]).reset_index(drop=True)
+        ).drop(columns=["abs_distance_to_entry_618_pct"]).reset_index(drop=True)
 
     return entries_df, rejects_df
 
