@@ -539,18 +539,34 @@ def build_hourly_entries(
     _ = min_hh_count
 
     hourly = hourly_df.copy()
-    hourly["DateTime"] = pd.to_datetime(hourly["DateTime"])
+    hourly["DateTime"] = pd.to_datetime(hourly["DateTime"], errors="coerce")
+    hourly = hourly.dropna(subset=["DateTime"]).copy()
+
+    if getattr(hourly["DateTime"].dt, "tz", None) is not None:
+        hourly["DateTime"] = hourly["DateTime"].dt.tz_convert("UTC").dt.tz_localize(None)
+
     hourly = hourly.sort_values(["Ticker", "DateTime"])
 
     for _, row in combined.iterrows():
         ticker = row["Ticker"]
-        retr_low_date = pd.to_datetime(row["DailyRetrLowDate"])
+        retr_low_date = pd.to_datetime(row["DailyRetrLowDate"], errors="coerce")
         retr_low_price = float(row["DailyRetrLowPrice"])
 
         g = hourly[hourly["Ticker"] == ticker].copy()
         if g.empty:
             rejects.append({"Ticker": ticker, "RejectReason": "missing_hourly_data"})
             continue
+
+        if pd.isna(retr_low_date):
+            rejects.append({"Ticker": ticker, "RejectReason": "invalid_daily_low_datetime"})
+            continue
+
+        if getattr(g["DateTime"].dt, "tz", None) is not None and retr_low_date.tzinfo is None:
+            retr_low_date = retr_low_date.tz_localize("UTC").tz_localize(None)
+        elif getattr(g["DateTime"].dt, "tz", None) is None and retr_low_date.tzinfo is not None:
+            retr_low_date = retr_low_date.tz_convert("UTC").tz_localize(None)
+        elif retr_low_date.tzinfo is not None:
+            retr_low_date = retr_low_date.tz_convert("UTC").tz_localize(None)
 
         after_low = g[g["DateTime"] > retr_low_date].copy()
         if after_low.empty:
@@ -1387,8 +1403,19 @@ def run_engine():
     try:
         hourly_df = load_all_market_data_hourly()
         hourly_entries_df, hourly_rejects_df = build_hourly_entries(combined, hourly_df)
-    except Exception:
+    except Exception as exc:
+        import traceback
+
         hourly_entries_df = pd.DataFrame()
-        hourly_rejects_df = pd.DataFrame()
+        hourly_rejects_df = pd.DataFrame(
+            [
+                {
+                    "Ticker": "__ERROR__",
+                    "RejectReason": "hourly_pipeline_exception",
+                    "Error": str(exc),
+                    "Traceback": traceback.format_exc(),
+                }
+            ]
+        )
 
     return df, combined, insight_df, hourly_entries_df, hourly_rejects_df
