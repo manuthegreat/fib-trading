@@ -131,7 +131,7 @@ def get_sti_universe():
 # 2. YAHOO DOWNLOADER (600 days, batched)
 # ==========================================================
 
-def download_yahoo_prices(tickers, label, period="600d"):
+def download_yahoo_prices(tickers, label, period="600d", interval="1d"):
     """
     Downloads last `period` of OHLC for a list of tickers.
     Uses yf.download in batches of 40 tickers (no manual threads).
@@ -154,6 +154,7 @@ def download_yahoo_prices(tickers, label, period="600d"):
             data = yf.download(
                 batch,
                 period=period,
+                interval=interval,
                 group_by="ticker",
                 auto_adjust=False,
                 threads=True,
@@ -214,4 +215,40 @@ def load_all_market_data():
     combined = combined.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
     print("\nFinal merged dataframe shape:", combined.shape)
+    return combined
+
+
+def load_all_market_data_hourly():
+    """
+    Returns merged hourly OHLC dataframe for SP500 + HSI + STI.
+    Output columns include: Ticker, DateTime, Open, High, Low, Close.
+    """
+    print("Building universes for hourly data...")
+
+    sp500 = get_sp500_universe()
+    hsi = get_hsi_universe()
+    sti = get_sti_universe()
+
+    sp = download_yahoo_prices(sp500["Ticker"].tolist(), "SP500", period="60d", interval="60m")
+    hs = download_yahoo_prices(hsi["Ticker"].tolist(), "HSI", period="60d", interval="60m")
+    st = download_yahoo_prices(sti["Ticker"].tolist(), "STI", period="60d", interval="60m")
+
+    if not (sp or hs or st):
+        raise RuntimeError("No hourly OHLC data downloaded from Yahoo")
+
+    combined = pd.concat(sp + hs + st, ignore_index=True)
+
+    datetime_col = "Datetime" if "Datetime" in combined.columns else "Date"
+    if datetime_col not in combined.columns:
+        raise RuntimeError("Hourly data missing Datetime/Date column")
+
+    combined = combined.rename(columns={datetime_col: "DateTime"})
+    combined["DateTime"] = pd.to_datetime(combined["DateTime"])
+    combined = combined.sort_values(["Ticker", "DateTime"]).reset_index(drop=True)
+
+    required = {"Ticker", "DateTime", "Open", "High", "Low", "Close"}
+    missing = required.difference(combined.columns)
+    if missing:
+        raise RuntimeError(f"Hourly data missing required columns: {sorted(missing)}")
+
     return combined

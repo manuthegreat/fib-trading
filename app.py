@@ -104,11 +104,11 @@ st.sidebar.write("Run this daily after market close / before open.")
 # -----------------------------
 @st.cache_data(show_spinner=True)
 def compute_dashboard():
-    df_all, combined, insight_df = run_engine()
-    return df_all, combined, insight_df
+    df_all, combined, insight_df, daily_list, hourly_list = run_engine()
+    return df_all, combined, insight_df, daily_list, hourly_list
 
 
-df_all, combined, insight_df = compute_dashboard()
+df_all, combined, insight_df, daily_list, hourly_list = compute_dashboard()
 
 if combined.empty:
     st.error("No names in watchlist / combined. Check data or parameters.")
