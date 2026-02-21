@@ -572,6 +572,9 @@ def build_hourly_entries(
         local_idx = eligible["High"].idxmax()
         local_high = float(eligible.loc[local_idx, "High"])
         local_high_time = pd.to_datetime(eligible.loc[local_idx, "DateTime"])
+        local_idx = after_low["High"].idxmax()
+        local_high = float(after_low.loc[local_idx, "High"])
+        local_high_time = pd.to_datetime(after_low.loc[local_idx, "DateTime"])
 
         last_bar = after_low.iloc[-1]
         last_close = float(last_bar["Close"])
@@ -579,6 +582,9 @@ def build_hourly_entries(
         last_high = float(last_bar["High"])
 
         bars_since_high = int((after_low["DateTime"] > local_high_time).sum())
+        if bars_since_high < 3:
+            rejects.append({"Ticker": ticker, "RejectReason": "high_too_recent"})
+            continue
 
         retrace_from_high_pct = (local_high - last_close) / local_high
         retracing_now = (
