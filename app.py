@@ -179,6 +179,15 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
             if pd.notna(retr_low_dt):
                 retr_low_dt = retr_low_dt.tz_convert(None)
             if pd.notna(high_dt):
+            ticker_hourly["DateTime"] = pd.to_datetime(ticker_hourly["DateTime"], errors="coerce")
+            ticker_hourly = ticker_hourly.dropna(subset=["DateTime"]).sort_values("DateTime")
+
+            retr_low_dt = pd.to_datetime(hrow.get("DailyRetrLowDate"), errors="coerce")
+            high_dt = pd.to_datetime(hrow.get("local_high_time"), errors="coerce")
+
+            if pd.notna(retr_low_dt) and getattr(retr_low_dt, "tzinfo", None) is not None:
+                retr_low_dt = retr_low_dt.tz_convert(None)
+            if pd.notna(high_dt) and getattr(high_dt, "tzinfo", None) is not None:
                 high_dt = high_dt.tz_convert(None)
 
             max_dt = ticker_hourly["DateTime"].max()
