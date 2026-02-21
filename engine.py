@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf  # still unused but kept in case you extend later
 from datetime import datetime, timedelta
-from updater import load_all_market_data
+from updater import load_all_market_data, load_all_market_data_hourly
 
 
 # Optional: console display settings (used only if you print from here)
@@ -1082,18 +1082,42 @@ No-Trade Conditions:
 # =========================================================
 def run_engine():
     """
-    Runs your full pipeline and returns:
-    - df_all: full OHLC dataframe
+    Runs full pipeline and returns:
+    - df_daily: daily OHLC dataframe
     - combined: final ranked dashboard dataframe
-    - insight_df: subset of combined with non-empty INSIGHT_TAGS
+    - insight_df: subset with non-empty INSIGHT_TAGS
+    - daily_list: tickers with retracement low in 61.8-78.6 within last 30 trading days
+    - hourly_list: hourly confirmation list for daily_list names
     """
-    df = load_all_market_data()
-    watch = build_watchlist(df, lookback_days=LOOKBACK_DAYS)
+    df_daily = load_all_market_data()
+
+    daily_required = {"Ticker", "Date", "Open", "High", "Low", "Close"}
+    missing_daily = daily_required.difference(df_daily.columns)
+    if missing_daily:
+        raise ValueError(f"Daily data missing required columns: {sorted(missing_daily)}")
+
+    watch = build_watchlist(df_daily, lookback_days=LOOKBACK_DAYS)
+
+    # Daily list based on retracement-low landing in 61.8-78.6 zone
+    daily_list = build_daily_list_last_30_days(df_daily, days=30, lookback_days=LOOKBACK_DAYS)
+
+    # Hourly confirmation list for daily_list names
+    hourly_list = pd.DataFrame()
+    try:
+        df_hourly = load_all_market_data_hourly()
+        hourly_required = {"Ticker", "DateTime", "Open", "High", "Low", "Close"}
+        missing_hourly = hourly_required.difference(df_hourly.columns)
+        if missing_hourly:
+            raise ValueError(f"Hourly data missing required columns: {sorted(missing_hourly)}")
+        hourly_list = build_hourly_entry_list(df_hourly, daily_list)
+    except Exception:
+        # Keep dashboard path resilient if hourly source is unavailable.
+        hourly_list = pd.DataFrame()
 
     if watch.empty:
         combined = pd.DataFrame()
         insight_df = pd.DataFrame()
-        return df, combined, insight_df
+        return df_daily, combined, insight_df, daily_list, hourly_list
 
     # Enhance watchlist
     watch["Retracement %"] = watch["Retracement"] * 100
@@ -1120,7 +1144,6 @@ def run_engine():
         axis=1,
     )
 
-    # R:R & distances (needed before sorting)
     watch["R:R"] = (watch["Target Price"] - watch["Entry Price"]) / (
         watch["Entry Price"] - watch["Stop Price"]
     )
@@ -1137,7 +1160,6 @@ def run_engine():
         (watch["Target Price"] - watch["Latest Price"]) / watch["Latest Price"]
     ) * 100
 
-    # ---------- SCORING ----------
     watch["RetraceScore"] = watch["Retracement %"].apply(fib_retrace_score)
     watch["StopDistanceScore"] = (
         (watch["Latest Price"] - watch["Stop Price"])
@@ -1151,32 +1173,25 @@ def run_engine():
         + 0.4 * watch["SwingRangeScore"]
     )
 
-    # Prime setups only
-    watch["Prime Setup"] = watch["Retracement %"].between(50, 78.6)
+    # Prime setups only (61.8-78.6)
+    watch["Prime Setup"] = watch["Retracement %"].between(61.8, 78.6)
     watch = watch[watch["Prime Setup"]]
 
     if watch.empty:
         combined = pd.DataFrame()
         insight_df = pd.DataFrame()
-        return df, combined, insight_df
+        return df_daily, combined, insight_df, daily_list, hourly_list
 
-    # CONFIRMATION
-    confirm = confirmation_engine(df, watch)
+    confirm = confirmation_engine(df_daily, watch)
 
-    # Add Shape classification ranking
     confirm["ShapePriority"] = confirm["Shape"].apply(shape_priority)
-
-    # Scores & NEXT_ACTION
     confirm["BUY_QUALITY"] = confirm.apply(compute_buy_quality, axis=1)
     confirm["READINESS_SCORE"] = confirm.apply(compute_watch_readiness, axis=1)
     confirm["NEXT_ACTION"] = confirm.apply(next_action, axis=1)
-
-    # Entry timing & pressure metrics
     confirm["PERFECT_ENTRY"] = confirm.apply(compute_perfect_entry, axis=1)
     confirm["ENTRY_BIAS"] = confirm.apply(compute_entry_bias, axis=1)
     confirm["BREAKOUT_PRESSURE"] = confirm.apply(compute_breakout_pressure, axis=1)
 
-    # Sorting logic (same as your script)
     confirm["SignalPriority"] = confirm["Shape"].apply(shape_priority)
     confirm["WatchPriority"] = confirm.apply(
         lambda r: r["READINESS_SCORE"]
@@ -1208,7 +1223,6 @@ def run_engine():
         ascending=[True, False, True, True, False, False, False, False]
     ).reset_index(drop=True)
 
-    # Insight tags
     confirm["INSIGHT_TAGS"] = confirm.apply(generate_insight_tags, axis=1)
 
     combined = confirm.copy()
@@ -1219,7 +1233,7 @@ def run_engine():
 
     insight_df = combined[combined["INSIGHT_TAGS"] != ""].copy()
 
-    return df, combined, insight_df
+    return df_daily, combined, insight_df, daily_list, hourly_list
 
 
 
@@ -1303,6 +1317,11 @@ def build_daily_list_last_30_days(df_daily: pd.DataFrame, days=30, lookback_days
     For each ticker, scan last N trading days (as-of each day),
     keep the most recent day where retracement-low fell in 61.8–78.6 zone.
     """
+    required = {"Ticker", "Date", "High", "Low"}
+    missing = required.difference(df_daily.columns)
+    if missing:
+        raise ValueError(f"build_daily_list_last_30_days missing columns: {sorted(missing)}")
+
     out = []
     df_daily = df_daily.sort_values(["Ticker", "Date"]).copy()
 
@@ -1352,6 +1371,16 @@ def build_hourly_entry_list(df_hourly: pd.DataFrame, daily_list: pd.DataFrame,
     List B:
     For each ticker from List A, confirm HH structure and compute entry/stop/tp from hourly data.
     """
+    hourly_required = {"Ticker", "DateTime", "High", "Low", "Close"}
+    missing_hourly = hourly_required.difference(df_hourly.columns)
+    if missing_hourly:
+        raise ValueError(f"build_hourly_entry_list missing hourly columns: {sorted(missing_hourly)}")
+
+    daily_required = {"Ticker", "AsOf", "RetrLow", "RetrLowDate"}
+    missing_daily = daily_required.difference(daily_list.columns)
+    if missing_daily:
+        raise ValueError(f"build_hourly_entry_list missing daily_list columns: {sorted(missing_daily)}")
+
     if daily_list.empty:
         return pd.DataFrame()
 
