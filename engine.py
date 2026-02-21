@@ -531,6 +531,9 @@ def build_hourly_entries(
     entries = []
     rejects = []
 
+    # Kept for signature stability; hourly inclusion no longer depends on entry proximity.
+    _ = near_entry_tol
+
     hourly = hourly_df.copy()
     hourly["DateTime"] = pd.to_datetime(hourly["DateTime"])
     hourly = hourly.sort_values(["Ticker", "DateTime"])
@@ -589,7 +592,8 @@ def build_hourly_entries(
         last_high = float(last_bar["High"])
 
         pullback_pct = (local_high - last_close) / local_high
-        if pullback_pct < min_pullback_pct:
+        retracing_now = (last_close < local_high) and (pullback_pct >= min_pullback_pct)
+        if not retracing_now:
             rejects.append({"Ticker": ticker, "RejectReason": "no_pullback"})
             continue
 
@@ -603,12 +607,8 @@ def build_hourly_entries(
             rejects.append({"Ticker": ticker, "RejectReason": "invalid_trade_levels"})
             continue
 
-        triggered_last_bar = (last_low <= entry) and (entry <= last_high)
-        near_entry = abs(last_close - entry) / entry <= near_entry_tol
-
-        if not (triggered_last_bar or near_entry):
-            rejects.append({"Ticker": ticker, "RejectReason": "entry_too_far"})
-            continue
+        distance_to_entry_pct = (last_close - entry) / entry
+        entry_hit = (last_low <= entry) and (entry <= last_high)
 
         entries.append(
             {
@@ -622,8 +622,9 @@ def build_hourly_entries(
                 "take_profit": take_profit,
                 "last_close": last_close,
                 "pullback_pct": pullback_pct,
-                "triggered_last_bar": bool(triggered_last_bar),
-                "near_entry": bool(near_entry),
+                "distance_to_entry_pct": distance_to_entry_pct,
+                "entry_hit": bool(entry_hit),
+                "retracing_now": bool(retracing_now),
                 "HH_count_used": min_hh_count,
                 "pivot_high_times": [t.isoformat() for t in pivot_times],
                 "pivot_high_values": pivot_high_values,
@@ -634,10 +635,11 @@ def build_hourly_entries(
     rejects_df = pd.DataFrame(rejects)
 
     if not entries_df.empty:
+        entries_df["abs_distance_to_entry_pct"] = entries_df["distance_to_entry_pct"].abs()
         entries_df = entries_df.sort_values(
-            by=["triggered_last_bar", "near_entry", "pullback_pct"],
-            ascending=[False, False, False],
-        ).reset_index(drop=True)
+            by=["entry_hit", "abs_distance_to_entry_pct", "pullback_pct"],
+            ascending=[False, True, False],
+        ).drop(columns=["abs_distance_to_entry_pct"]).reset_index(drop=True)
 
     return entries_df, rejects_df
 

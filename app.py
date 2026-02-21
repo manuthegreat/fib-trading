@@ -154,8 +154,9 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
         "take_profit",
         "last_close",
         "pullback_pct",
-        "triggered_last_bar",
-        "near_entry",
+        "distance_to_entry_pct",
+        "entry_hit",
+        "retracing_now",
     ]].copy()
     st.dataframe(hourly_view, hide_index=True, use_container_width=True)
 else:
@@ -398,8 +399,8 @@ def render_summary_card(row, hourly_row=None):
 <b>Stop:</b> {hr['stop']:.4f}<br>
 <b>Take Profit:</b> {hr['take_profit']:.4f}<br>
 <b>Pullback:</b> {hr['pullback_pct']*100:.2f}%<br>
-<b>Triggered Last Bar:</b> {bool(hr['triggered_last_bar'])}<br>
-<b>Near Entry:</b> {bool(hr['near_entry'])}<br><br>
+<b>Distance to Entry:</b> {hr['distance_to_entry_pct']*100:.2f}%<br>
+<b>Entry Hit:</b> {bool(hr['entry_hit'])}<br><br>
 """
 
     html = f"""
@@ -507,4 +508,3 @@ Evaluates the **quality of the retracement**, **cleanliness of the higher low**,
 
 Score > 80 normally signals an institution-grade entry structure.
 """)
-
