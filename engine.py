@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf  # still unused but kept in case you extend later
 from datetime import datetime, timedelta
-from updater import load_all_market_data
+from updater import load_all_market_data, load_all_market_data_hourly
 
 
 # Optional: console display settings (used only if you print from here)
@@ -471,6 +471,8 @@ def confirmation_engine(df, watch):
             "SwingRange": row["Swing Range"],
             "SwingLow": row["Swing Low Price"],
             "SwingHigh": row["Swing High Price"],
+            "DailyRetrLowDate": pd.to_datetime(retr_low_date),
+            "DailyRetrLowPrice": float(retr_low_price),
         }
 
         # Inject recent history for compression scoring
@@ -479,6 +481,165 @@ def confirmation_engine(df, watch):
         results.append(row_dict)
 
     return pd.DataFrame(results)
+
+
+def _hourly_pivot_high_indices(highs, look=5):
+    pivots = []
+    if len(highs) < 2 * look + 1:
+        return pivots
+
+    for i in range(look, len(highs) - look):
+        if highs[i] == max(highs[i - look : i + look + 1]):
+            pivots.append(i)
+
+    return pivots
+
+
+def build_hourly_entries(
+    combined,
+    hourly_df,
+    pivot_look=5,
+    min_hh_count=2,
+    min_pullback_pct=0.007,
+    near_entry_tol=0.02,
+    max_bars_after_low=320,
+):
+    """
+    Build hourly entry candidates from DAILY-qualified tickers (combined/List A).
+    Returns:
+    - hourly_entries_df: actionable hourly candidates
+    - hourly_rejects_df: optional diagnostics for rejected tickers
+    """
+    if combined is None or combined.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    if hourly_df is None or hourly_df.empty:
+        rejects = combined[["Ticker"]].copy()
+        rejects["RejectReason"] = "missing_hourly_data"
+        return pd.DataFrame(), rejects
+
+    required_combined = {"Ticker", "DailyRetrLowDate", "DailyRetrLowPrice"}
+    required_hourly = {"Ticker", "DateTime", "Open", "High", "Low", "Close"}
+
+    if required_combined.difference(combined.columns):
+        raise RuntimeError(
+            "combined dataframe missing required daily retracement columns for hourly scan"
+        )
+    if required_hourly.difference(hourly_df.columns):
+        raise RuntimeError("hourly dataframe missing required OHLC columns")
+
+    entries = []
+    rejects = []
+
+    hourly = hourly_df.copy()
+    hourly["DateTime"] = pd.to_datetime(hourly["DateTime"])
+    hourly = hourly.sort_values(["Ticker", "DateTime"])
+
+    for _, row in combined.iterrows():
+        ticker = row["Ticker"]
+        retr_low_date = pd.to_datetime(row["DailyRetrLowDate"])
+        retr_low_price = float(row["DailyRetrLowPrice"])
+
+        g = hourly[hourly["Ticker"] == ticker].copy()
+        if g.empty:
+            rejects.append({"Ticker": ticker, "RejectReason": "missing_hourly_data"})
+            continue
+
+        after_low = g[g["DateTime"] > retr_low_date].copy()
+        if after_low.empty:
+            rejects.append({"Ticker": ticker, "RejectReason": "no_hourly_after_daily_low"})
+            continue
+
+        if len(after_low) > max_bars_after_low:
+            after_low = after_low.tail(max_bars_after_low).copy()
+
+        highs = after_low["High"].to_numpy()
+        pivots = _hourly_pivot_high_indices(highs, look=pivot_look)
+
+        if len(pivots) < min_hh_count:
+            rejects.append({"Ticker": ticker, "RejectReason": "not_enough_pivot_highs"})
+            continue
+
+        pivot_high_values = [float(after_low.iloc[i]["High"]) for i in pivots]
+        pivot_times = [pd.to_datetime(after_low.iloc[i]["DateTime"]) for i in pivots]
+
+        selected_idxs = None
+        for end in range(len(pivots), min_hh_count - 1, -1):
+            candidate = pivots[end - min_hh_count : end]
+            candidate_highs = [float(after_low.iloc[i]["High"]) for i in candidate]
+            if all(x < y for x, y in zip(candidate_highs, candidate_highs[1:])):
+                selected_idxs = candidate
+                break
+
+        if selected_idxs is None:
+            rejects.append({"Ticker": ticker, "RejectReason": "highs_not_rising"})
+            continue
+
+        local_idx = selected_idxs[-1]
+        local_high = float(after_low.iloc[local_idx]["High"])
+        local_high_time = pd.to_datetime(after_low.iloc[local_idx]["DateTime"])
+
+        if not (local_high_time > retr_low_date):
+            rejects.append({"Ticker": ticker, "RejectReason": "local_high_not_after_daily_low"})
+            continue
+
+        last_bar = after_low.iloc[-1]
+        last_close = float(last_bar["Close"])
+        last_low = float(last_bar["Low"])
+        last_high = float(last_bar["High"])
+
+        pullback_pct = (local_high - last_close) / local_high
+        if pullback_pct < min_pullback_pct:
+            rejects.append({"Ticker": ticker, "RejectReason": "no_pullback"})
+            continue
+
+        fib_low = retr_low_price
+        fib_high = local_high
+        entry = fib_high - 0.618 * (fib_high - fib_low)
+        stop = fib_low
+        take_profit = fib_high
+
+        if not (stop < entry < take_profit):
+            rejects.append({"Ticker": ticker, "RejectReason": "invalid_trade_levels"})
+            continue
+
+        triggered_last_bar = (last_low <= entry) and (entry <= last_high)
+        near_entry = abs(last_close - entry) / entry <= near_entry_tol
+
+        if not (triggered_last_bar or near_entry):
+            rejects.append({"Ticker": ticker, "RejectReason": "entry_too_far"})
+            continue
+
+        entries.append(
+            {
+                "Ticker": ticker,
+                "DailyRetrLowDate": retr_low_date,
+                "DailyRetrLowPrice": fib_low,
+                "local_high_time": local_high_time,
+                "local_high": fib_high,
+                "entry": entry,
+                "stop": stop,
+                "take_profit": take_profit,
+                "last_close": last_close,
+                "pullback_pct": pullback_pct,
+                "triggered_last_bar": bool(triggered_last_bar),
+                "near_entry": bool(near_entry),
+                "HH_count_used": min_hh_count,
+                "pivot_high_times": [t.isoformat() for t in pivot_times],
+                "pivot_high_values": pivot_high_values,
+            }
+        )
+
+    entries_df = pd.DataFrame(entries)
+    rejects_df = pd.DataFrame(rejects)
+
+    if not entries_df.empty:
+        entries_df = entries_df.sort_values(
+            by=["triggered_last_bar", "near_entry", "pullback_pct"],
+            ascending=[False, False, False],
+        ).reset_index(drop=True)
+
+    return entries_df, rejects_df
 
 
 def setup_shape(g, retr_low_date, last_local_high):
@@ -1084,6 +1245,8 @@ def run_engine():
     - df_all: full OHLC dataframe
     - combined: final ranked dashboard dataframe
     - insight_df: subset of combined with non-empty INSIGHT_TAGS
+    - hourly_entries_df: hourly entry candidates built from combined tickers
+    - hourly_rejects_df: hourly rejects diagnostics
     """
     df = load_all_market_data()
     watch = build_watchlist(df, lookback_days=LOOKBACK_DAYS)
@@ -1091,7 +1254,7 @@ def run_engine():
     if watch.empty:
         combined = pd.DataFrame()
         insight_df = pd.DataFrame()
-        return df, combined, insight_df
+        return df, combined, insight_df, pd.DataFrame(), pd.DataFrame()
 
     # Enhance watchlist
     watch["Retracement %"] = watch["Retracement"] * 100
@@ -1156,7 +1319,7 @@ def run_engine():
     if watch.empty:
         combined = pd.DataFrame()
         insight_df = pd.DataFrame()
-        return df, combined, insight_df
+        return df, combined, insight_df, pd.DataFrame(), pd.DataFrame()
 
     # CONFIRMATION
     confirm = confirmation_engine(df, watch)
@@ -1217,4 +1380,11 @@ def run_engine():
 
     insight_df = combined[combined["INSIGHT_TAGS"] != ""].copy()
 
-    return df, combined, insight_df
+    try:
+        hourly_df = load_all_market_data_hourly()
+        hourly_entries_df, hourly_rejects_df = build_hourly_entries(combined, hourly_df)
+    except Exception:
+        hourly_entries_df = pd.DataFrame()
+        hourly_rejects_df = pd.DataFrame()
+
+    return df, combined, insight_df, hourly_entries_df, hourly_rejects_df

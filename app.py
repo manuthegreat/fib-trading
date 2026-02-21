@@ -4,7 +4,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from engine import run_engine, generate_trading_summary
-from updater import load_all_market_data
 
 
 # ---------------------------------------------------------
@@ -104,11 +103,11 @@ st.sidebar.write("Run this daily after market close / before open.")
 # -----------------------------
 @st.cache_data(show_spinner=True)
 def compute_dashboard():
-    df_all, combined, insight_df = run_engine()
-    return df_all, combined, insight_df
+    df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df = run_engine()
+    return df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df
 
 
-df_all, combined, insight_df = compute_dashboard()
+df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df = compute_dashboard()
 
 if combined.empty:
     st.error("No names in watchlist / combined. Check data or parameters.")
@@ -136,6 +135,31 @@ if selected_insights:
 if df_view.empty:
     st.warning("No tickers match current filters.")
     st.stop()
+
+
+# ---------------------------------------------------------
+# Hourly Entry Candidates (List B)
+# ---------------------------------------------------------
+st.write("### Hourly Entry Candidates (List B)")
+
+if hourly_entries_df is not None and not hourly_entries_df.empty:
+    hourly_view = hourly_entries_df[[
+        "Ticker",
+        "DailyRetrLowDate",
+        "DailyRetrLowPrice",
+        "local_high_time",
+        "local_high",
+        "entry",
+        "stop",
+        "take_profit",
+        "last_close",
+        "pullback_pct",
+        "triggered_last_bar",
+        "near_entry",
+    ]].copy()
+    st.dataframe(hourly_view, hide_index=True, use_container_width=True)
+else:
+    st.info("No hourly entry candidates found for current run.")
 
 
 # ---------------------------------------------------------
@@ -360,10 +384,23 @@ def format_section(summary_text, start, end):
         return "N/A"
 
 
-def render_summary_card(row):
+def render_summary_card(row, hourly_row=None):
     summary = generate_trading_summary(row)
 
     st.markdown("### 📘 Trading Summary")
+
+    hourly_plan_html = ""
+    if hourly_row is not None and not hourly_row.empty:
+        hr = hourly_row.iloc[0]
+        hourly_plan_html = f"""
+<h3 style=\"color:#4CC9F0; margin-bottom:5px;\">⏱️ Hourly Entry Plan</h3>
+<b>Entry:</b> {hr['entry']:.4f}<br>
+<b>Stop:</b> {hr['stop']:.4f}<br>
+<b>Take Profit:</b> {hr['take_profit']:.4f}<br>
+<b>Pullback:</b> {hr['pullback_pct']*100:.2f}%<br>
+<b>Triggered Last Bar:</b> {bool(hr['triggered_last_bar'])}<br>
+<b>Near Entry:</b> {bool(hr['near_entry'])}<br><br>
+"""
 
     html = f"""
 <div style="background-color:#f8f9fa;padding:20px;border-radius:10px;border:1px solid #ddd; font-size:15px;">
@@ -387,6 +424,9 @@ def render_summary_card(row):
 
 <h3 style="color:#F72585; margin-bottom:5px;">⚠️ Risk Conditions</h3>
 {format_section(summary, "No-Trade Conditions:", None)}
+
+<br>
+{hourly_plan_html}
 
 </div>
 """
@@ -417,7 +457,8 @@ if ticker_selected:
         )
 
     plot_ticker_chart(df_all, row_sel, lookback_days=lookback_days)
-    render_summary_card(row_sel)
+    hourly_sel = hourly_entries_df[hourly_entries_df["Ticker"] == ticker_selected] if hourly_entries_df is not None and not hourly_entries_df.empty else None
+    render_summary_card(row_sel, hourly_row=hourly_sel)
 else:
     st.info("Click a row in the table to display charts and trading summary.")
 
@@ -466,5 +507,4 @@ Evaluates the **quality of the retracement**, **cleanliness of the higher low**,
 
 Score > 80 normally signals an institution-grade entry structure.
 """)
-
 
