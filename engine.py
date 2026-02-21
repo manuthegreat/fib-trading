@@ -591,6 +591,8 @@ def next_action(row):
     return "Not actionable"
 
 
+
+
 # =========================================================
 # 8. BUY QUALITY SCORE
 # =========================================================
@@ -1218,3 +1220,221 @@ def run_engine():
     insight_df = combined[combined["INSIGHT_TAGS"] != ""].copy()
 
     return df, combined, insight_df
+
+
+
+def _fib_levels(low, high):
+    rng = high - low
+    return {
+        "fib618": high - 0.618 * rng,
+        "fib786": high - 0.786 * rng,
+        "fib500": high - 0.500 * rng,
+        "fib382": high - 0.382 * rng,
+    }
+
+def find_daily_wave_and_retr_low(group: pd.DataFrame, asof_date: pd.Timestamp, lookback_days=300):
+    """
+    Returns the swing (low->high) and the correction low AFTER swing high, as-of a date.
+    """
+    g = group[group["Date"] <= asof_date].sort_values("Date")
+    if len(g) < 50:
+        return None
+
+    window = g[g["Date"] >= (asof_date - pd.Timedelta(days=lookback_days))]
+    if len(window) < 50:
+        return None
+
+    # --- Swing high pivot (your existing pivot logic simplified) ---
+    highs = window["High"].values
+    lows  = window["Low"].values
+    dates = window["Date"].values
+
+    look = 5
+    pivots = []
+    for i in range(look, len(highs) - look):
+        if highs[i] == np.max(highs[i-look:i+look+1]):
+            pivots.append(i)
+    if not pivots:
+        return None
+
+    best_i = max(pivots, key=lambda idx: highs[idx])
+    swing_high = float(highs[best_i])
+    swing_high_date = pd.to_datetime(dates[best_i])
+
+    # swing low BEFORE that high
+    prior = window.iloc[:best_i+1]
+    low_row = prior.loc[prior["Low"].idxmin()]
+    swing_low = float(low_row["Low"])
+    swing_low_date = pd.to_datetime(low_row["Date"])
+
+    if swing_low >= swing_high:
+        return None
+
+    # correction after swing high up to asof
+    corr = g[(g["Date"] > swing_high_date) & (g["Date"] <= asof_date)].copy()
+    if corr.empty:
+        return None
+
+    retr_row = corr.loc[corr["Low"].idxmin()]
+    retr_low = float(retr_row["Low"])
+    retr_low_date = pd.to_datetime(retr_row["Date"])
+
+    fib = _fib_levels(swing_low, swing_high)
+
+    # Must land between 61.8 and 78.6 (price-based zone)
+    # NOTE: fib786 < fib618 in price terms (deeper pullback = lower price)
+    in_zone = (retr_low <= fib["fib618"]) and (retr_low >= fib["fib786"])
+
+    return {
+        "SwingLowDate": swing_low_date,
+        "SwingLow": swing_low,
+        "SwingHighDate": swing_high_date,
+        "SwingHigh": swing_high,
+        "RetrLowDate": retr_low_date,
+        "RetrLow": retr_low,
+        "Fib618": fib["fib618"],
+        "Fib786": fib["fib786"],
+        "InZone": in_zone,
+    }
+
+def build_daily_list_last_30_days(df_daily: pd.DataFrame, days=30, lookback_days=300):
+    """
+    List A:
+    For each ticker, scan last N trading days (as-of each day),
+    keep the most recent day where retracement-low fell in 61.8–78.6 zone.
+    """
+    out = []
+    df_daily = df_daily.sort_values(["Ticker", "Date"]).copy()
+
+    for ticker, g in df_daily.groupby("Ticker"):
+        g = g.sort_values("Date")
+        if len(g) < lookback_days // 2:
+            continue
+
+        # last N dates for that ticker (trading days)
+        asof_dates = g["Date"].tail(days).unique()
+
+        best = None
+        for d in asof_dates:
+            res = find_daily_wave_and_retr_low(g, pd.to_datetime(d), lookback_days=lookback_days)
+            if not res:
+                continue
+            if res["InZone"]:
+                best = res
+                best["Ticker"] = ticker
+                best["AsOf"] = pd.to_datetime(d)
+
+        if best:
+            out.append(best)
+
+    if not out:
+        return pd.DataFrame()
+
+    return pd.DataFrame(out).sort_values(["AsOf", "Ticker"], ascending=[False, True]).reset_index(drop=True)
+
+
+def pivot_highs(series: np.ndarray, left=3, right=3):
+    """
+    Returns indices of pivot highs where series[i] is max in [i-left, i+right].
+    """
+    idxs = []
+    for i in range(left, len(series) - right):
+        if series[i] == np.max(series[i-left:i+right+1]):
+            idxs.append(i)
+    return idxs
+
+def build_hourly_entry_list(df_hourly: pd.DataFrame, daily_list: pd.DataFrame,
+                            hours_lookback=240,  # ~10 trading days
+                            pivot_left=3, pivot_right=3,
+                            min_hh_count=2,
+                            min_pullback_pct=0.007):
+    """
+    List B:
+    For each ticker from List A, confirm HH structure and compute entry/stop/tp from hourly data.
+    """
+    if daily_list.empty:
+        return pd.DataFrame()
+
+    out = []
+    df_hourly = df_hourly.sort_values(["Ticker", "DateTime"]).copy()
+
+    daily_map = daily_list.set_index("Ticker").to_dict(orient="index")
+
+    for ticker, g in df_hourly.groupby("Ticker"):
+        if ticker not in daily_map:
+            continue
+
+        g = g.sort_values("DateTime")
+        if len(g) < 100:
+            continue
+
+        # Only recent hours for trigger logic
+        gh = g.tail(hours_lookback).copy()
+        highs = gh["High"].values
+        lows  = gh["Low"].values
+        closes = gh["Close"].values
+
+        piv = pivot_highs(highs, left=pivot_left, right=pivot_right)
+        if len(piv) < (min_hh_count + 1):
+            continue
+
+        # Take last few pivot highs and ensure they are rising (HH)
+        last_pivs = piv[-(min_hh_count+1):]
+        ph = [highs[i] for i in last_pivs]
+
+        is_hh = all(ph[i] > ph[i-1] for i in range(1, len(ph)))
+        if not is_hh:
+            continue
+
+        local_high_idx = last_pivs[-1]
+        local_high = float(highs[local_high_idx])
+        local_high_time = pd.to_datetime(gh["DateTime"].iloc[local_high_idx])
+
+        # must be pulling back (not still ripping at highs)
+        last_close = float(closes[-1])
+        pullback_ok = (local_high - last_close) / max(local_high, 1e-9) >= min_pullback_pct
+        if not pullback_ok:
+            continue
+
+        # Daily fib low from Stage A
+        fib_low = float(daily_map[ticker]["RetrLow"])
+        fib_low_date = pd.to_datetime(daily_map[ticker]["RetrLowDate"])
+        asof = pd.to_datetime(daily_map[ticker]["AsOf"])
+
+        if fib_low >= local_high:
+            continue
+
+        rng = local_high - fib_low
+        entry = local_high - 0.618 * rng   # 61.8% retracement
+        stop  = fib_low
+        tp    = local_high
+
+        # Optional sanity: don’t allow entry below stop
+        if entry <= stop:
+            continue
+
+        # Check if entry has triggered in last bar
+        last_bar = gh.iloc[-1]
+        triggered = (last_bar["Low"] <= entry <= last_bar["High"])
+
+        rr = (tp - entry) / max(entry - stop, 1e-9)
+
+        out.append({
+            "Ticker": ticker,
+            "Daily_AsOf": asof,
+            "Daily_FibLowDate": fib_low_date,
+            "Daily_FibLow": fib_low,
+            "Hourly_LocalHighTime": local_high_time,
+            "Hourly_LocalHigh": local_high,
+            "Entry_61_8": entry,
+            "Stop": stop,
+            "TakeProfit": tp,
+            "RR": rr,
+            "Triggered_LastBar": bool(triggered),
+            "LastClose": last_close,
+        })
+
+    if not out:
+        return pd.DataFrame()
+
+    return pd.DataFrame(out).sort_values(["Triggered_LastBar", "RR"], ascending=[False, False]).reset_index(drop=True)
