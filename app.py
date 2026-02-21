@@ -101,13 +101,17 @@ st.sidebar.write("Run this daily after market close / before open.")
 # -----------------------------
 # Cache Engine Run
 # -----------------------------
+ENGINE_VERSION = "2026-02-21-listb-debug-v2"
+
+
 @st.cache_data(show_spinner=True)
-def compute_dashboard():
+def compute_dashboard(engine_version):
+    _ = engine_version
     df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df = run_engine()
     return df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df
 
 
-df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df = compute_dashboard()
+df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df = compute_dashboard(ENGINE_VERSION)
 
 if combined.empty:
     st.error("No names in watchlist / combined. Check data or parameters.")
@@ -142,6 +146,25 @@ if df_view.empty:
 # ---------------------------------------------------------
 st.write("### Hourly Entry Candidates (List B)")
 
+
+# Debug visibility for List B build pipeline
+st.write("#### List B Debug")
+st.caption(
+    f"Combined tickers: {len(combined)} | Hourly entries: {len(hourly_entries_df)} | Hourly rejects: {len(hourly_rejects_df)}"
+)
+
+if hourly_rejects_df is not None and not hourly_rejects_df.empty:
+    st.write("Reject reasons (counts)")
+    st.dataframe(
+        hourly_rejects_df["RejectReason"].value_counts().rename_axis("RejectReason").reset_index(name="count"),
+        hide_index=True,
+        use_container_width=True,
+    )
+    st.write("Reject rows")
+    st.dataframe(hourly_rejects_df, hide_index=True, use_container_width=True)
+else:
+    st.info("No hourly rejects for this run.")
+
 if hourly_entries_df is not None and not hourly_entries_df.empty:
     hourly_view = hourly_entries_df[[
         "Ticker",
@@ -149,15 +172,35 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
         "DailyRetrLowPrice",
         "local_high_time",
         "local_high",
-        "entry",
+        "entry_382",
+        "entry_50",
+        "entry_618",
         "stop",
         "take_profit",
         "last_close",
-        "pullback_pct",
-        "distance_to_entry_pct",
-        "entry_hit",
-        "retracing_now",
+        "retrace_from_high_pct",
+        "bars_since_high",
+        "distance_to_entry_618_pct",
+        "entry_618_hit",
     ]].copy()
+
+    hourly_view = hourly_view.rename(
+        columns={
+            "DailyRetrLowDate": "Daily Low Date",
+            "DailyRetrLowPrice": "Daily Low",
+            "local_high_time": "Hourly High Time",
+            "local_high": "Hourly High",
+            "entry_382": "Entry 38.2%",
+            "entry_50": "Entry 50%",
+            "entry_618": "Entry 61.8%",
+            "take_profit": "Take Profit",
+            "last_close": "Last Close",
+            "retrace_from_high_pct": "Retrace % From High",
+            "bars_since_high": "Bars Since High",
+            "distance_to_entry_618_pct": "Distance to 61.8%",
+            "entry_618_hit": "61.8% Hit",
+        }
+    )
     st.dataframe(hourly_view, hide_index=True, use_container_width=True)
 else:
     st.info("No hourly entry candidates found for current run.")
