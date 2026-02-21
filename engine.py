@@ -5,11 +5,9 @@ from updater import load_all_market_data, load_all_market_data_hourly
 
 
 DAILY_LOOKBACK_DAYS = 300
-DAILY_HISTORY_DAYS = 30
 HOURS_LOOKBACK = 240
 DAILY_PIVOT_LOOK = 5
 HOURLY_PIVOT_LOOK = 5
-MIN_PULLBACK_PCT = 0.007
 
 
 def pivot_highs(highs: np.ndarray, look: int):
@@ -23,13 +21,13 @@ def pivot_highs(highs: np.ndarray, look: int):
     return pivots
 
 
-def _evaluate_daily_in_zone_event(group: pd.DataFrame, as_of: pd.Timestamp):
+def _evaluate_daily_watch_candidate(group: pd.DataFrame, as_of: pd.Timestamp):
     window = group[
         (group["Date"] <= as_of)
         & (group["Date"] >= (as_of - pd.Timedelta(days=DAILY_LOOKBACK_DAYS)))
     ].copy()
 
-    if window.empty:
+    if len(window) < 10:
         return None
 
     window = window.sort_values("Date").reset_index(drop=True)
@@ -48,10 +46,14 @@ def _evaluate_daily_in_zone_event(group: pd.DataFrame, as_of: pd.Timestamp):
     swing_low = float(prior_segment.loc[low_idx, "Low"])
     swing_low_date = pd.to_datetime(prior_segment.loc[low_idx, "Date"])
 
+    fib500 = swing_high - 0.500 * (swing_high - swing_low)
     fib618 = swing_high - 0.618 * (swing_high - swing_low)
     fib786 = swing_high - 0.786 * (swing_high - swing_low)
 
     correction = window[(window["Date"] > swing_high_date) & (window["Date"] <= as_of)]
+    latest_price = float(window["Close"].iloc[-1])
+    latest_date = pd.to_datetime(window["Date"].iloc[-1])
+
     if correction.empty:
         return None
 
@@ -59,17 +61,28 @@ def _evaluate_daily_in_zone_event(group: pd.DataFrame, as_of: pd.Timestamp):
     retr_low_idx = correction["Low"].idxmin()
     retr_low_date = pd.to_datetime(correction.loc[retr_low_idx, "Date"])
 
-    if not (fib786 <= retr_low <= fib618):
+    # Invalidate setups that already broke below the 78.6% level after swing high.
+    if (correction["Low"] < fib786).any():
+        return None
+
+    # Keep setups with at least a 38% retracement from swing high.
+    swing_range = swing_high - swing_low
+    retracement = (swing_high - latest_price) / swing_range if swing_range > 0 else np.nan
+    if pd.isna(retracement) or retracement < 0.38:
         return None
 
     return {
-        "AsOf": pd.to_datetime(as_of),
+        "AsOf": latest_date,
+        "LatestPrice": latest_price,
         "SwingLowDate": swing_low_date,
         "SwingLow": swing_low,
         "SwingHighDate": swing_high_date,
         "SwingHigh": swing_high,
+        "SwingRange": float(swing_range),
+        "Retracement": float(retracement),
         "RetrLowDate": retr_low_date,
         "RetrLow": retr_low,
+        "Fib500": float(fib500),
         "Fib618": float(fib618),
         "Fib786": float(fib786),
     }
@@ -80,26 +93,24 @@ def build_daily_list(df_daily: pd.DataFrame):
 
     for ticker, group in df_daily.groupby("Ticker"):
         group = group.sort_values("Date").copy()
-        as_of_dates = group["Date"].drop_duplicates().sort_values().tail(DAILY_HISTORY_DAYS)
-
-        latest_event = None
-        for as_of in as_of_dates.tolist():
-            event = _evaluate_daily_in_zone_event(group, pd.to_datetime(as_of))
-            if event is not None:
-                latest_event = event
-
-        if latest_event is not None:
-            rows.append({"Ticker": ticker, **latest_event})
+        as_of = pd.to_datetime(group["Date"].iloc[-1])
+        event = _evaluate_daily_watch_candidate(group, as_of)
+        if event is not None:
+            rows.append({"Ticker": ticker, **event})
 
     columns = [
         "Ticker",
         "AsOf",
+        "LatestPrice",
         "SwingLowDate",
         "SwingLow",
         "SwingHighDate",
         "SwingHigh",
+        "SwingRange",
+        "Retracement",
         "RetrLowDate",
         "RetrLow",
+        "Fib500",
         "Fib618",
         "Fib786",
     ]
@@ -114,8 +125,8 @@ def build_hourly_list(df_hourly: pd.DataFrame, daily_list_df: pd.DataFrame):
     columns = [
         "Ticker",
         "Daily_AsOf",
-        "Daily_RetrLowDate",
-        "Daily_RetrLow",
+        "Daily_SwingLowDate",
+        "Daily_SwingLow",
         "Hourly_LocalHighTime",
         "Hourly_LocalHigh",
         "Entry_61_8",
@@ -142,23 +153,21 @@ def build_hourly_list(df_hourly: pd.DataFrame, daily_list_df: pd.DataFrame):
         highs = window["High"].to_numpy()
         piv = pivot_highs(highs, look=HOURLY_PIVOT_LOOK)
 
-        if len(piv) < 3:
-            continue
-
-        last_three_values = [float(highs[i]) for i in piv[-3:]]
-        if not (last_three_values[0] < last_three_values[1] < last_three_values[2]):
-            continue
-
-        local_idx = piv[-1]
-        local_high = float(highs[local_idx])
-        local_high_time = pd.to_datetime(window.iloc[local_idx]["DateTime"])
+        if piv:
+            local_idx = piv[-1]
+            local_high = float(highs[local_idx])
+            local_high_time = pd.to_datetime(window.iloc[local_idx]["DateTime"])
+        else:
+            local_high = float(window["High"].max())
+            local_high_idx = window["High"].idxmax()
+            local_high_time = pd.to_datetime(window.loc[local_high_idx, "DateTime"])
 
         last_close = float(window["Close"].iloc[-1])
         pullback_pct = (local_high - last_close) / local_high if local_high > 0 else np.nan
-        if pd.isna(pullback_pct) or pullback_pct < MIN_PULLBACK_PCT:
-            continue
+        if pd.isna(pullback_pct):
+            pullback_pct = 0.0
 
-        fib_low = float(drow["RetrLow"])
+        fib_low = float(drow["SwingLow"])
         entry = local_high - 0.618 * (local_high - fib_low)
         stop = fib_low
         take_profit = local_high
@@ -170,8 +179,8 @@ def build_hourly_list(df_hourly: pd.DataFrame, daily_list_df: pd.DataFrame):
             {
                 "Ticker": ticker,
                 "Daily_AsOf": pd.to_datetime(drow["AsOf"]),
-                "Daily_RetrLowDate": pd.to_datetime(drow["RetrLowDate"]),
-                "Daily_RetrLow": fib_low,
+                "Daily_SwingLowDate": pd.to_datetime(drow["SwingLowDate"]),
+                "Daily_SwingLow": fib_low,
                 "Hourly_LocalHighTime": local_high_time,
                 "Hourly_LocalHigh": local_high,
                 "Entry_61_8": float(entry),
