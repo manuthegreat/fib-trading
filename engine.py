@@ -500,9 +500,11 @@ def build_hourly_entries(
     hourly_df,
     pivot_look=5,
     min_hh_count=2,
-    min_pullback_pct=0.007,
+    min_pullback_pct=0.002,
+    max_pullback_pct=0.12,
     near_entry_tol=0.02,
     max_bars_after_low=320,
+    min_bars_since_high=3,
 ):
     """
     Build hourly entry candidates from DAILY-qualified tickers (combined/List A).
@@ -531,22 +533,43 @@ def build_hourly_entries(
     entries = []
     rejects = []
 
-    # Kept for signature stability; hourly inclusion no longer depends on entry proximity.
+    # Kept for signature stability.
     _ = near_entry_tol
+    _ = pivot_look
+    _ = min_hh_count
+    _ = min_pullback_pct
+    _ = max_pullback_pct
+    _ = min_bars_since_high
 
     hourly = hourly_df.copy()
-    hourly["DateTime"] = pd.to_datetime(hourly["DateTime"])
+    hourly["DateTime"] = pd.to_datetime(hourly["DateTime"], errors="coerce")
+    hourly = hourly.dropna(subset=["DateTime"]).copy()
+
+    if getattr(hourly["DateTime"].dt, "tz", None) is not None:
+        hourly["DateTime"] = hourly["DateTime"].dt.tz_convert("UTC").dt.tz_localize(None)
+
     hourly = hourly.sort_values(["Ticker", "DateTime"])
 
     for _, row in combined.iterrows():
         ticker = row["Ticker"]
-        retr_low_date = pd.to_datetime(row["DailyRetrLowDate"])
+        retr_low_date = pd.to_datetime(row["DailyRetrLowDate"], errors="coerce")
         retr_low_price = float(row["DailyRetrLowPrice"])
 
         g = hourly[hourly["Ticker"] == ticker].copy()
         if g.empty:
             rejects.append({"Ticker": ticker, "RejectReason": "missing_hourly_data"})
             continue
+
+        if pd.isna(retr_low_date):
+            rejects.append({"Ticker": ticker, "RejectReason": "invalid_daily_low_datetime"})
+            continue
+
+        if getattr(g["DateTime"].dt, "tz", None) is not None and retr_low_date.tzinfo is None:
+            retr_low_date = retr_low_date.tz_localize("UTC").tz_localize(None)
+        elif getattr(g["DateTime"].dt, "tz", None) is None and retr_low_date.tzinfo is not None:
+            retr_low_date = retr_low_date.tz_convert("UTC").tz_localize(None)
+        elif retr_low_date.tzinfo is not None:
+            retr_low_date = retr_low_date.tz_convert("UTC").tz_localize(None)
 
         after_low = g[g["DateTime"] > retr_low_date].copy()
         if after_low.empty:
@@ -556,59 +579,70 @@ def build_hourly_entries(
         if len(after_low) > max_bars_after_low:
             after_low = after_low.tail(max_bars_after_low).copy()
 
-        highs = after_low["High"].to_numpy()
-        pivots = _hourly_pivot_high_indices(highs, look=pivot_look)
-
-        if len(pivots) < min_hh_count:
-            rejects.append({"Ticker": ticker, "RejectReason": "not_enough_pivot_highs"})
+        if len(after_low) < 20:
+            rejects.append({"Ticker": ticker, "RejectReason": "insufficient_hourly_bars"})
             continue
 
-        pivot_high_values = [float(after_low.iloc[i]["High"]) for i in pivots]
-        pivot_times = [pd.to_datetime(after_low.iloc[i]["DateTime"]) for i in pivots]
+        prev_close = after_low["Close"].shift(1)
+        tr1 = after_low["High"] - after_low["Low"]
+        tr2 = (after_low["High"] - prev_close).abs()
+        tr3 = (after_low["Low"] - prev_close).abs()
+        true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr14 = true_range.rolling(14).mean()
 
-        selected_idxs = None
-        for end in range(len(pivots), min_hh_count - 1, -1):
-            candidate = pivots[end - min_hh_count : end]
-            candidate_highs = [float(after_low.iloc[i]["High"]) for i in candidate]
-            if all(x < y for x, y in zip(candidate_highs, candidate_highs[1:])):
-                selected_idxs = candidate
-                break
+        impulse_move = after_low["Close"] - after_low["Close"].shift(6)
+        impulse_mask = impulse_move > (1.2 * atr14)
 
-        if selected_idxs is None:
-            rejects.append({"Ticker": ticker, "RejectReason": "highs_not_rising"})
+        impulse_indices = after_low.index[impulse_mask.fillna(False)]
+        if len(impulse_indices) == 0:
+            rejects.append({"Ticker": ticker, "RejectReason": "no_impulse_bar"})
             continue
 
-        local_idx = selected_idxs[-1]
-        local_high = float(after_low.iloc[local_idx]["High"])
-        local_high_time = pd.to_datetime(after_low.iloc[local_idx]["DateTime"])
+        impulse_idx = impulse_indices[-1]
+        impulse_pos = after_low.index.get_loc(impulse_idx)
+        window_start = max(0, impulse_pos - 1)
+        window_end = min(len(after_low), impulse_pos + 2)
+        local_window = after_low.iloc[window_start:window_end]
 
-        if not (local_high_time > retr_low_date):
-            rejects.append({"Ticker": ticker, "RejectReason": "local_high_not_after_daily_low"})
+        if local_window.empty:
+            rejects.append({"Ticker": ticker, "RejectReason": "invalid_impulse_window"})
             continue
+
+        local_idx = local_window["High"].idxmax()
+        local_high = float(local_window.loc[local_idx, "High"])
+        local_high_time = pd.to_datetime(local_window.loc[local_idx, "DateTime"])
 
         last_bar = after_low.iloc[-1]
         last_close = float(last_bar["Close"])
         last_low = float(last_bar["Low"])
         last_high = float(last_bar["High"])
 
-        pullback_pct = (local_high - last_close) / local_high
-        retracing_now = (last_close < local_high) and (pullback_pct >= min_pullback_pct)
-        if not retracing_now:
-            rejects.append({"Ticker": ticker, "RejectReason": "no_pullback"})
+        if len(after_low) < 2:
+            rejects.append({"Ticker": ticker, "RejectReason": "insufficient_recent_bars"})
+            continue
+
+        previous_close = float(after_low.iloc[-2]["Close"])
+        currently_pulling_back = (last_close < local_high) and (last_close < previous_close)
+        if not currently_pulling_back:
+            rejects.append({"Ticker": ticker, "RejectReason": "not_currently_pulling_back"})
             continue
 
         fib_low = retr_low_price
         fib_high = local_high
-        entry = fib_high - 0.618 * (fib_high - fib_low)
+        entry_382 = fib_high - 0.382 * (fib_high - fib_low)
+        entry_50 = fib_high - 0.50 * (fib_high - fib_low)
+        entry_618 = fib_high - 0.618 * (fib_high - fib_low)
         stop = fib_low
         take_profit = fib_high
 
-        if not (stop < entry < take_profit):
+        if not (stop < entry_618 < take_profit):
             rejects.append({"Ticker": ticker, "RejectReason": "invalid_trade_levels"})
             continue
 
-        distance_to_entry_pct = (last_close - entry) / entry
-        entry_hit = (last_low <= entry) and (entry <= last_high)
+        retrace_from_high_pct = (local_high - last_close) / local_high
+        distance_to_entry_618_pct = (last_close - entry_618) / entry_618
+        entry_618_hit = (last_low <= entry_618) and (entry_618 <= last_high)
+        bars_since_high = int((after_low["DateTime"] > local_high_time).sum())
 
         entries.append(
             {
@@ -617,17 +651,18 @@ def build_hourly_entries(
                 "DailyRetrLowPrice": fib_low,
                 "local_high_time": local_high_time,
                 "local_high": fib_high,
-                "entry": entry,
+                "entry_382": entry_382,
+                "entry_50": entry_50,
+                "entry_618": entry_618,
                 "stop": stop,
                 "take_profit": take_profit,
                 "last_close": last_close,
-                "pullback_pct": pullback_pct,
-                "distance_to_entry_pct": distance_to_entry_pct,
-                "entry_hit": bool(entry_hit),
-                "retracing_now": bool(retracing_now),
-                "HH_count_used": min_hh_count,
-                "pivot_high_times": [t.isoformat() for t in pivot_times],
-                "pivot_high_values": pivot_high_values,
+                "last_low": last_low,
+                "last_high": last_high,
+                "retrace_from_high_pct": retrace_from_high_pct,
+                "bars_since_high": bars_since_high,
+                "distance_to_entry_618_pct": distance_to_entry_618_pct,
+                "entry_618_hit": bool(entry_618_hit),
             }
         )
 
@@ -635,11 +670,11 @@ def build_hourly_entries(
     rejects_df = pd.DataFrame(rejects)
 
     if not entries_df.empty:
-        entries_df["abs_distance_to_entry_pct"] = entries_df["distance_to_entry_pct"].abs()
+        entries_df["abs_distance_to_entry_618_pct"] = entries_df["distance_to_entry_618_pct"].abs()
         entries_df = entries_df.sort_values(
-            by=["entry_hit", "abs_distance_to_entry_pct", "pullback_pct"],
+            by=["entry_618_hit", "abs_distance_to_entry_618_pct", "retrace_from_high_pct"],
             ascending=[False, True, False],
-        ).drop(columns=["abs_distance_to_entry_pct"]).reset_index(drop=True)
+        ).drop(columns=["abs_distance_to_entry_618_pct"]).reset_index(drop=True)
 
     return entries_df, rejects_df
 
@@ -1249,6 +1284,7 @@ def run_engine():
     - insight_df: subset of combined with non-empty INSIGHT_TAGS
     - hourly_entries_df: hourly entry candidates built from combined tickers
     - hourly_rejects_df: hourly rejects diagnostics
+    - hourly_df: full hourly OHLC dataframe used for List B charting
     """
     df = load_all_market_data()
     watch = build_watchlist(df, lookback_days=LOOKBACK_DAYS)
@@ -1256,7 +1292,7 @@ def run_engine():
     if watch.empty:
         combined = pd.DataFrame()
         insight_df = pd.DataFrame()
-        return df, combined, insight_df, pd.DataFrame(), pd.DataFrame()
+        return df, combined, insight_df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     # Enhance watchlist
     watch["Retracement %"] = watch["Retracement"] * 100
@@ -1321,7 +1357,7 @@ def run_engine():
     if watch.empty:
         combined = pd.DataFrame()
         insight_df = pd.DataFrame()
-        return df, combined, insight_df, pd.DataFrame(), pd.DataFrame()
+        return df, combined, insight_df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     # CONFIRMATION
     confirm = confirmation_engine(df, watch)
@@ -1385,8 +1421,20 @@ def run_engine():
     try:
         hourly_df = load_all_market_data_hourly()
         hourly_entries_df, hourly_rejects_df = build_hourly_entries(combined, hourly_df)
-    except Exception:
-        hourly_entries_df = pd.DataFrame()
-        hourly_rejects_df = pd.DataFrame()
+    except Exception as exc:
+        import traceback
 
-    return df, combined, insight_df, hourly_entries_df, hourly_rejects_df
+        hourly_df = pd.DataFrame()
+        hourly_entries_df = pd.DataFrame()
+        hourly_rejects_df = pd.DataFrame(
+            [
+                {
+                    "Ticker": "__ERROR__",
+                    "RejectReason": "hourly_pipeline_exception",
+                    "Error": str(exc),
+                    "Traceback": traceback.format_exc(),
+                }
+            ]
+        )
+
+    return df, combined, insight_df, hourly_entries_df, hourly_rejects_df, hourly_df
