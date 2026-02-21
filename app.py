@@ -169,8 +169,40 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
 
         if (not selected_hourly_row.empty) and (not ticker_hourly.empty):
             hrow = selected_hourly_row.iloc[0]
-            ticker_hourly["DateTime"] = pd.to_datetime(ticker_hourly["DateTime"], errors="coerce")
-            ticker_hourly = ticker_hourly.dropna(subset=["DateTime"]).sort_values("DateTime").tail(240)
+            ticker_hourly["DateTime"] = pd.to_datetime(ticker_hourly["DateTime"], errors="coerce", utc=True)
+            ticker_hourly["DateTime"] = ticker_hourly["DateTime"].dt.tz_convert(None)
+            ticker_hourly = ticker_hourly.dropna(subset=["DateTime"]).sort_values("DateTime")
+
+            retr_low_dt = pd.to_datetime(hrow.get("DailyRetrLowDate"), errors="coerce", utc=True)
+            high_dt = pd.to_datetime(hrow.get("local_high_time"), errors="coerce", utc=True)
+
+            if pd.notna(retr_low_dt):
+                retr_low_dt = retr_low_dt.tz_convert(None)
+            if pd.notna(high_dt):
+                high_dt = high_dt.tz_convert(None)
+
+            max_dt = ticker_hourly["DateTime"].max()
+            context_start = high_dt - pd.Timedelta(hours=72) if pd.notna(high_dt) else max_dt - pd.Timedelta(hours=72)
+
+            if pd.notna(retr_low_dt):
+                window_start = min(retr_low_dt, context_start)
+            else:
+                window_start = context_start
+
+            if pd.notna(high_dt):
+                window_end = max(max_dt, high_dt + pd.Timedelta(hours=6))
+            else:
+                window_end = max_dt
+
+            default_window_hourly = ticker_hourly[
+                (ticker_hourly["DateTime"] >= window_start) & (ticker_hourly["DateTime"] <= window_end)
+            ]
+
+            if len(default_window_hourly) < 50:
+                fallback_window = ticker_hourly.tail(240)
+                if not fallback_window.empty:
+                    window_start = fallback_window["DateTime"].min()
+                    window_end = fallback_window["DateTime"].max()
 
             fig_hourly = go.Figure(
                 data=[
@@ -211,6 +243,7 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
                 template="plotly_white",
                 height=500,
             )
+            fig_hourly.update_xaxes(range=[window_start, window_end])
             st.plotly_chart(fig_hourly, use_container_width=True)
 else:
     st.info("No hourly entry candidates found for current run.")
