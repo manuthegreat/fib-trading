@@ -2,9 +2,9 @@
 updater.py  (simple, Streamlit-friendly version)
 
 ✓ Builds SP500, HSI, EURO STOXX 50 universes
-✓ Downloads daily + hourly OHLC from Yahoo (yfinance)
-✓ Batches requests with yf.download (no manual threads)
-✓ Retries on rate-limit / transient errors
+✓ Downloads daily OHLC (600d) from Yahoo in batches
+✓ Hourly data is PROVIDED VIA helper that downloads ONLY the tickers you pass in
+  (critical to avoid Yahoo rate limits)
 ✓ Returns ONE CLEAN MERGED DATAFRAME
 ✓ No parquet saving, no disk IO
 """
@@ -18,82 +18,6 @@ from typing import Iterable, List, Optional
 import pandas as pd
 import requests
 import yfinance as yf
-
-
-# ==========================================================
-# 0. SMALL HELPERS
-# ==========================================================
-
-def _chunks(lst: List[str], n: int) -> List[List[str]]:
-    return [lst[i:i + n] for i in range(0, len(lst), n)]
-
-
-def _normalize_yf_download_output(data: pd.DataFrame, tickers: List[str]) -> dict:
-    """
-    yfinance returns:
-      - MultiIndex columns when multiple tickers
-      - Single-index columns when one ticker
-    Normalize to: {ticker: df_ticker}
-    """
-    out = {}
-
-    if data is None or getattr(data, "empty", True):
-        return out
-
-    # Single ticker => columns like Open/High/Low/Close/Adj Close/Volume
-    if not isinstance(data.columns, pd.MultiIndex):
-        # Infer the only ticker
-        if len(tickers) == 1:
-            out[tickers[0]] = data
-        else:
-            # Unexpected shape; best effort: treat as empty
-            return {}
-        return out
-
-    # Multi ticker => first level is field or ticker depending on group_by
-    # With group_by="ticker": columns are (TICKER, Field)
-    # So data[ticker] works.
-    for t in tickers:
-        try:
-            out[t] = data[t]
-        except Exception:
-            continue
-
-    return out
-
-
-def _download_with_retries(
-    tickers: List[str],
-    period: str,
-    interval: str,
-    max_retries: int = 4,
-    base_sleep: float = 1.5,
-) -> pd.DataFrame:
-    """
-    Safer yfinance download:
-    - threads=False to reduce rate-limit spikes
-    - retries with exponential backoff
-    """
-    last_exc = None
-    for attempt in range(max_retries):
-        try:
-            return yf.download(
-                tickers,
-                period=period,
-                interval=interval,
-                group_by="ticker",
-                auto_adjust=False,
-                threads=False,     # IMPORTANT: reduce 429/rate-limit issues
-                progress=False,
-            )
-        except Exception as e:
-            last_exc = e
-            # exponential backoff
-            sleep_s = base_sleep * (2 ** attempt)
-            time.sleep(sleep_s)
-
-    # If we got here, all retries failed
-    raise last_exc
 
 
 # ==========================================================
@@ -156,92 +80,118 @@ def get_hsi_universe() -> pd.DataFrame:
         + ".HK"
     )
 
-    if "name" in df.columns:
-        name_col = "name"
-    else:
-        possible = [c for c in df.columns if c != ticker_col]
-        name_col = possible[0]
+    # Name + sector are messy on wiki; keep best-effort
+    name_col = "name" if "name" in df.columns else None
+    if name_col is None:
+        candidates = [c for c in df.columns if c != ticker_col]
+        name_col = candidates[0] if candidates else ticker_col
 
     df["Name"] = df[name_col].astype(str).str.strip()
-    df["Sector"] = df.get("sub-index", df.get("industry", "")).astype(str)
+    df["Sector"] = df.get("sub-index", df.get("industry", ""))
+
     return df[["Ticker", "Name", "Sector"]]
 
 
 def get_eurostoxx50_universe() -> pd.DataFrame:
     """
-    Hardcoded EURO STOXX 50 constituents (Yahoo-friendly tickers).
-    This avoids scraping changes + fixes the "no Europe in output" problem.
+    Hardcoded EURO STOXX 50 tickers in Yahoo format.
+    NOTE: Constituents change over time; if STOXX rebalances, update this list.
     """
     data = [
-        ("ADS.DE", "adidas", "Retail"),
-        ("ADYEN.AS", "Adyen", "Technology"),
-        ("AD.AS", "Ahold Delhaize", "Consumer staples"),
-        ("AI.PA", "Air Liquide", "Basic materials"),
-        ("AIR.PA", "Airbus", "Industrials"),
+        # Germany
+        ("ADS.DE", "Adidas", "Consumer Discretionary"),
         ("ALV.DE", "Allianz", "Financials"),
-        ("ABI.BR", "Anheuser-Busch InBev", "Consumer defensive"),
-        ("ARGX.BR", "argenx", "Healthcare"),
-        ("ASML.AS", "ASML Holding", "Technology"),
-        ("CS.PA", "AXA", "Financials"),
-        ("BAS.DE", "BASF", "Basic materials"),
-        ("BAYN.DE", "Bayer", "Healthcare"),
-        ("BBVA.MC", "BBVA", "Financials"),
-        ("SAN.MC", "Banco Santander", "Financials"),
-        ("BMW.DE", "BMW", "Consumer cyclical"),
-        ("BNP.PA", "BNP Paribas", "Financials"),
-        ("BN.PA", "Danone", "Consumer defensive"),
-        ("DBK.DE", "Deutsche Bank", "Financials"),
+        ("BAS.DE", "BASF", "Materials"),
+        ("BAYN.DE", "Bayer", "Health Care"),
+        ("BMW.DE", "BMW", "Consumer Discretionary"),
         ("DB1.DE", "Deutsche Börse", "Financials"),
-        ("DHL.DE", "DHL Group", "Industrials"),
-        ("DTE.DE", "Deutsche Telekom", "Communication services"),
-        ("ENEL.MI", "Enel", "Utilities"),
-        ("ENI.MI", "Eni", "Energy"),
-        ("EL.PA", "EssilorLuxottica", "Healthcare"),
-        ("RACE.MI", "Ferrari", "Consumer cyclical"),
-        ("RMS.PA", "Hermès", "Consumer cyclical"),
-        ("IBE.MC", "Iberdrola", "Utilities"),
-        ("ITX.MC", "Inditex", "Consumer cyclical"),
-        ("IFX.DE", "Infineon", "Technology"),
-        ("INGA.AS", "ING Groep", "Financials"),
-        ("ISP.MI", "Intesa Sanpaolo", "Financials"),
-        ("OR.PA", "L'Oréal", "Consumer defensive"),
-        ("MC.PA", "LVMH", "Consumer cyclical"),
-        ("MBG.DE", "Mercedes-Benz Group", "Consumer cyclical"),
+        ("DBK.DE", "Deutsche Bank", "Financials"),
+        ("DHL.DE", "Deutsche Post", "Industrials"),
+        ("DTE.DE", "Deutsche Telekom", "Communication"),
+        ("IFX.DE", "Infineon Technologies", "Information Technology"),
+        ("MBG.DE", "Mercedes-Benz Group", "Consumer Discretionary"),
         ("MUV2.DE", "Munich Re", "Financials"),
-        ("NDA-FI.HE", "Nordea Bank", "Financials"),
-        ("PRX.AS", "Prosus", "Consumer cyclical"),
-        ("RHM.DE", "Rheinmetall", "Industrials"),
-        ("SAF.PA", "Safran", "Industrials"),
-        ("SGO.PA", "Saint-Gobain", "Industrials"),
-        ("SAN.PA", "Sanofi", "Healthcare"),
-        ("SAP.DE", "SAP", "Technology"),
-        ("SU.PA", "Schneider Electric", "Industrials"),
+        ("RWE.DE", "RWE", "Utilities"),
+        ("SAP.DE", "SAP", "Information Technology"),
         ("SIE.DE", "Siemens", "Industrials"),
         ("ENR.DE", "Siemens Energy", "Industrials"),
-        ("TTE.PA", "TotalEnergies", "Energy"),
+        ("VOW3.DE", "Volkswagen Group (Pref)", "Consumer Discretionary"),
+
+        # France
+        ("AI.PA", "Air Liquide", "Materials"),
+        ("AIR.PA", "Airbus", "Industrials"),
+        ("BNP.PA", "BNP Paribas", "Financials"),
+        ("CS.PA", "AXA", "Financials"),
         ("DG.PA", "Vinci", "Industrials"),
-        ("UCG.MI", "UniCredit", "Financials"),
-        ("VOW.DE", "Volkswagen", "Consumer cyclical"),
+        ("EL.PA", "EssilorLuxottica", "Health Care"),
+        ("MC.PA", "LVMH", "Consumer Discretionary"),
+        ("OR.PA", "L'Oréal", "Consumer Staples"),
+        ("RMS.PA", "Hermès", "Consumer Discretionary"),
+        ("SAF.PA", "Safran", "Industrials"),
+        ("SAN.PA", "Sanofi", "Health Care"),
+        ("SGO.PA", "Saint-Gobain", "Industrials"),
+        ("SU.PA", "Schneider Electric", "Industrials"),
+        ("TTE.PA", "TotalEnergies", "Energy"),
+        ("VIV.PA", "Vivendi", "Communication"),
+
+        # Netherlands
+        ("AD.AS", "Ahold Delhaize", "Consumer Staples"),
+        ("ADYEN.AS", "Adyen", "Financials"),
+        ("ASML.AS", "ASML Holding", "Information Technology"),
+        ("HEIA.AS", "Heineken", "Consumer Staples"),
+        ("INGA.AS", "ING Group", "Financials"),
+        ("PHIA.AS", "Philips", "Health Care"),
+        ("PRX.AS", "Prosus", "Consumer Discretionary"),
         ("WKL.AS", "Wolters Kluwer", "Industrials"),
+
+        # Spain
+        ("BBVA.MC", "BBVA", "Financials"),
+        ("IBE.MC", "Iberdrola", "Utilities"),
+        ("ITX.MC", "Inditex", "Consumer Discretionary"),
+        ("SAN.MC", "Banco Santander", "Financials"),
+
+        # Italy
+        ("ENEL.MI", "Enel", "Utilities"),
+        ("ENI.MI", "Eni", "Energy"),
+        ("ISP.MI", "Intesa Sanpaolo", "Financials"),
+        ("UCG.MI", "UniCredit", "Financials"),
+        ("STLAM.MI", "Stellantis", "Consumer Discretionary"),
+
+        # Belgium
+        ("ABI.BR", "Anheuser-Busch InBev", "Consumer Staples"),
+
+        # Finland
+        ("NDA-FI.HE", "Nordea", "Financials"),
     ]
-    return pd.DataFrame(data, columns=["Ticker", "Name", "Sector"])
+
+    df = pd.DataFrame(data, columns=["Ticker", "Name", "Sector"])
+    # Ensure uniqueness + non-empty
+    df["Ticker"] = df["Ticker"].astype(str).str.strip()
+    df = df[df["Ticker"] != ""].drop_duplicates(subset=["Ticker"]).reset_index(drop=True)
+    return df
 
 
 # ==========================================================
-# 2. YAHOO DOWNLOADER (batched)
+# 2. YAHOO DOWNLOADER (batched + retries)
 # ==========================================================
+
+def _chunk(lst: List[str], n: int) -> List[List[str]]:
+    return [lst[i:i + n] for i in range(0, len(lst), n)]
+
 
 def download_yahoo_prices(
-    tickers: Iterable[str],
+    tickers: List[str],
     label: str,
     period: str = "600d",
     interval: str = "1d",
-    batch_size: int = 25,
+    batch_size: int = 15,
+    max_retries: int = 3,
+    sleep_s: float = 1.0,
 ) -> List[pd.DataFrame]:
     """
-    Returns list of per-ticker OHLC frames with columns:
-      Date/Datetime index -> reset_index() -> Date/Datetime column
-      + Ticker + Index label
+    Downloads OHLC for a list of tickers.
+    Uses small batches + retries to reduce YF rate-limits.
+    Returns list of per-ticker DataFrames (with Date/Datetime index reset).
     """
     tickers = [str(t).strip() for t in tickers if str(t).strip()]
     if not tickers:
@@ -249,27 +199,50 @@ def download_yahoo_prices(
 
     frames: List[pd.DataFrame] = []
 
-    for batch in _chunks(tickers, batch_size):
-        try:
-            data = _download_with_retries(batch, period=period, interval=interval)
-        except Exception:
+    for batch in _chunk(tickers, batch_size):
+        last_exc = None
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                data = yf.download(
+                    tickers=batch,
+                    period=period,
+                    interval=interval,
+                    group_by="ticker",
+                    auto_adjust=False,
+                    threads=False,        # IMPORTANT: threads=True triggers rate limits faster
+                    progress=False,
+                )
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                # Exponential-ish backoff
+                time.sleep(sleep_s * attempt)
+
+        if last_exc is not None:
+            # Skip this batch; we keep going so the app still works.
             continue
 
-        per_ticker = _normalize_yf_download_output(data, batch)
-
+        # yfinance output format differs for 1 ticker vs many tickers
         for t in batch:
-            df_t = per_ticker.get(t)
-            if df_t is None or df_t.empty:
+            try:
+                if isinstance(data.columns, pd.MultiIndex):
+                    df_t = data[t].dropna().copy()
+                else:
+                    # single-ticker download returns flat columns
+                    df_t = data.dropna().copy()
+
+                if df_t.empty:
+                    continue
+
+                df_t["Ticker"] = t
+                df_t["Index"] = label
+                frames.append(df_t.reset_index())
+            except Exception:
                 continue
 
-            # Standardize
-            df_t = df_t.dropna().copy()
-            df_t["Ticker"] = t
-            df_t["Index"] = label
-            frames.append(df_t.reset_index())
-
-        # small pause between batches to reduce throttling
-        time.sleep(0.35)
+        time.sleep(sleep_s)
 
     return frames
 
@@ -295,57 +268,42 @@ def load_all_market_data() -> pd.DataFrame:
 
     combined = pd.concat(sp_frames + hs_frames + eu_frames, ignore_index=True)
 
-    # yfinance daily uses 'Date'
-    if "Date" not in combined.columns:
-        # fallback if reset_index produced something else
-        dt_col = "Datetime" if "Datetime" in combined.columns else None
-        if dt_col is None:
-            raise RuntimeError("Daily data missing Date column after download")
-        combined = combined.rename(columns={dt_col: "Date"})
-
+    # Standardize datetime column name
+    date_col = "Date" if "Date" in combined.columns else "Datetime"
+    combined = combined.rename(columns={date_col: "Date"})
     combined["Date"] = pd.to_datetime(combined["Date"], errors="coerce")
     combined = combined.dropna(subset=["Date"])
-    combined = combined.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
+    combined = combined.sort_values(["Ticker", "Date"]).reset_index(drop=True)
     return combined
 
 
-def load_all_market_data_hourly(tickers: Optional[Iterable[str]] = None) -> pd.DataFrame:
+def load_hourly_prices_for_tickers(tickers: Iterable[str]) -> pd.DataFrame:
     """
-    Returns merged HOURLY OHLC dataframe for SP500 + HSI + EURO STOXX 50.
-
-    KEY FIX:
-    - If you pass tickers=[...] it only downloads hourly for those names,
-      preventing yfinance rate-limits and making your hourly entries work.
+    Returns merged HOURLY OHLC dataframe ONLY for the tickers you pass in.
+    This is the only safe way to avoid rate limits and actually get hourly entries.
     """
-    if tickers is None:
-        # Default: full universes (NOT recommended; likely to rate-limit)
-        sp500 = get_sp500_universe()
-        hsi = get_hsi_universe()
-        euro = get_eurostoxx50_universe()
-        tickers_all = (
-            sp500["Ticker"].tolist()
-            + hsi["Ticker"].tolist()
-            + euro["Ticker"].tolist()
-        )
-    else:
-        tickers_all = [str(t).strip() for t in tickers if str(t).strip()]
+    tickers = sorted({str(t).strip() for t in tickers if str(t).strip()})
+    if not tickers:
+        return pd.DataFrame(columns=["Ticker", "DateTime", "Open", "High", "Low", "Close", "Index"])
 
-    # Hourly: keep it smaller to reduce throttling
-    frames = download_yahoo_prices(tickers_all, "MIXED", period="60d", interval="60m", batch_size=10)
+    frames = download_yahoo_prices(
+        tickers,
+        label="HOURLY",
+        period="60d",
+        interval="60m",
+        batch_size=10,
+        max_retries=4,
+        sleep_s=1.25,
+    )
+
     if not frames:
-        raise RuntimeError("No HOURLY OHLC data downloaded from Yahoo (rate-limit or invalid tickers)")
+        return pd.DataFrame(columns=["Ticker", "DateTime", "Open", "High", "Low", "Close", "Index"])
 
     combined = pd.concat(frames, ignore_index=True)
 
-    # yfinance hourly uses Datetime in many cases
-    if "Datetime" in combined.columns:
-        combined = combined.rename(columns={"Datetime": "DateTime"})
-    elif "Date" in combined.columns:
-        combined = combined.rename(columns={"Date": "DateTime"})
-    else:
-        raise RuntimeError("Hourly data missing Datetime/Date column")
-
+    dt_col = "Datetime" if "Datetime" in combined.columns else "Date"
+    combined = combined.rename(columns={dt_col: "DateTime"})
     combined["DateTime"] = pd.to_datetime(combined["DateTime"], errors="coerce")
     combined = combined.dropna(subset=["DateTime"])
     combined = combined.sort_values(["Ticker", "DateTime"]).reset_index(drop=True)
