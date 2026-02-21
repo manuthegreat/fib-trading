@@ -119,16 +119,6 @@ def compute_dashboard(engine_version):
 
 
 df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df, hourly_df = compute_dashboard(ENGINE_VERSION)
-    df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df, hourly_df = run_engine()
-    return df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df, hourly_df
-
-
-df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df, hourly_df = compute_dashboard(ENGINE_VERSION)
-    df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df = run_engine()
-    return df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df
-
-
-df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df = compute_dashboard(ENGINE_VERSION)
 
 if combined.empty:
     st.error("No names in watchlist / combined. Check data or parameters.")
