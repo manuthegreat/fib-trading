@@ -1439,7 +1439,8 @@ def run_engine():
     insight_df = combined[combined["INSIGHT_TAGS"] != ""].copy()
 
     try:
-        hourly_df = load_all_market_data_hourly()
+        from updater import load_hourly_prices_for_tickers
+        hourly_df = load_hourly_prices_for_tickers(combined["Ticker"].unique().tolist())
         hourly_entries_df, hourly_rejects_df = build_hourly_entries(combined, hourly_df)
     except Exception as exc:
         import traceback
