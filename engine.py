@@ -4,28 +4,27 @@ import pandas as pd
 from updater import load_all_market_data, load_all_market_data_hourly
 
 
-DAILY_LOOKBACK_DAYS = 300
-HOURS_LOOKBACK = 240
+LOOKBACK_DAYS = 300
 DAILY_PIVOT_LOOK = 5
-HOURLY_PIVOT_LOOK = 5
+HOURLY_PIVOT_LOOK = 2
 
 
-def pivot_highs(highs: np.ndarray, look: int):
+def _pivot_high_indices(values: np.ndarray, look: int) -> list[int]:
     pivots = []
-    if len(highs) < (2 * look + 1):
+    if len(values) < (2 * look + 1):
         return pivots
 
-    for i in range(look, len(highs) - look):
-        if highs[i] == np.max(highs[i - look : i + look + 1]):
+    for i in range(look, len(values) - look):
+        if values[i] == np.max(values[i - look : i + look + 1]):
             pivots.append(i)
     return pivots
 
 
-def _evaluate_daily_watch_candidate(group: pd.DataFrame, as_of: pd.Timestamp):
+def _find_swing_as_of_quick(group: pd.DataFrame, current_date: pd.Timestamp, lookback_days: int = LOOKBACK_DAYS):
     window = group[
-        (group["Date"] <= as_of)
-        & (group["Date"] >= (as_of - pd.Timedelta(days=DAILY_LOOKBACK_DAYS)))
-    ].copy()
+        (group["Date"] <= current_date)
+        & (group["Date"] >= (current_date - pd.Timedelta(days=lookback_days)))
+    ]
 
     if len(window) < 10:
         return None
@@ -33,198 +32,173 @@ def _evaluate_daily_watch_candidate(group: pd.DataFrame, as_of: pd.Timestamp):
     window = window.sort_values("Date").reset_index(drop=True)
     highs = window["High"].to_numpy()
 
-    piv = pivot_highs(highs, look=DAILY_PIVOT_LOOK)
-    if not piv:
+    pivots = _pivot_high_indices(highs, look=DAILY_PIVOT_LOOK)
+    if not pivots:
         return None
 
-    best_rel_idx = max(piv, key=lambda idx: highs[idx])
-    swing_high = float(highs[best_rel_idx])
+    best_rel_idx = max(pivots, key=lambda idx: highs[idx])
+    swing_high_price = float(highs[best_rel_idx])
     swing_high_date = pd.to_datetime(window.loc[best_rel_idx, "Date"])
 
     prior_segment = window.iloc[: best_rel_idx + 1]
     low_idx = prior_segment["Low"].idxmin()
-    swing_low = float(prior_segment.loc[low_idx, "Low"])
+    swing_low_price = float(prior_segment.loc[low_idx, "Low"])
     swing_low_date = pd.to_datetime(prior_segment.loc[low_idx, "Date"])
 
-    fib500 = swing_high - 0.500 * (swing_high - swing_low)
-    fib618 = swing_high - 0.618 * (swing_high - swing_low)
-    fib786 = swing_high - 0.786 * (swing_high - swing_low)
-
-    correction = window[(window["Date"] > swing_high_date) & (window["Date"] <= as_of)]
-    latest_price = float(window["Close"].iloc[-1])
-    latest_date = pd.to_datetime(window["Date"].iloc[-1])
-
-    if correction.empty:
+    if swing_low_price >= swing_high_price:
         return None
 
-    retr_low = float(correction["Low"].min())
-    retr_low_idx = correction["Low"].idxmin()
-    retr_low_date = pd.to_datetime(correction.loc[retr_low_idx, "Date"])
-
-    # Invalidate setups that already broke below the 78.6% level after swing high.
-    if (correction["Low"] < fib786).any():
-        return None
-
-    # Keep setups with at least a 38% retracement from swing high.
-    swing_range = swing_high - swing_low
-    retracement = (swing_high - latest_price) / swing_range if swing_range > 0 else np.nan
-    if pd.isna(retracement) or retracement < 0.38:
-        return None
+    swing_range = swing_high_price - swing_low_price
 
     return {
-        "AsOf": latest_date,
-        "LatestPrice": latest_price,
-        "SwingLowDate": swing_low_date,
-        "SwingLow": swing_low,
-        "SwingHighDate": swing_high_date,
-        "SwingHigh": swing_high,
-        "SwingRange": float(swing_range),
-        "Retracement": float(retracement),
-        "RetrLowDate": retr_low_date,
-        "RetrLow": retr_low,
-        "Fib500": float(fib500),
-        "Fib618": float(fib618),
-        "Fib786": float(fib786),
+        "Swing Low Date": swing_low_date,
+        "Swing Low Price": swing_low_price,
+        "Swing High Date": swing_high_date,
+        "Swing High Price": swing_high_price,
+        "Retrace 50": swing_high_price - 0.50 * swing_range,
+        "Retrace 61": swing_high_price - 0.618 * swing_range,
+        "Stop Consider (78.6%)": swing_high_price - 0.786 * swing_range,
     }
 
 
-def build_daily_list(df_daily: pd.DataFrame):
+def build_watchlist(df: pd.DataFrame, lookback_days: int = LOOKBACK_DAYS) -> pd.DataFrame:
     rows = []
 
-    for ticker, group in df_daily.groupby("Ticker"):
-        group = group.sort_values("Date").copy()
-        as_of = pd.to_datetime(group["Date"].iloc[-1])
-        event = _evaluate_daily_watch_candidate(group, as_of)
-        if event is not None:
-            rows.append({"Ticker": ticker, **event})
+    for ticker, group in df.groupby("Ticker"):
+        group = group.sort_values("Date")
 
-    columns = [
-        "Ticker",
-        "AsOf",
-        "LatestPrice",
-        "SwingLowDate",
-        "SwingLow",
-        "SwingHighDate",
-        "SwingHigh",
-        "SwingRange",
-        "Retracement",
-        "RetrLowDate",
-        "RetrLow",
-        "Fib500",
-        "Fib618",
-        "Fib786",
-    ]
+        latest_price = float(group["Close"].iloc[-1])
+        latest_date = pd.to_datetime(group["Date"].iloc[-1])
 
-    if not rows:
-        return pd.DataFrame(columns=columns)
-
-    return pd.DataFrame(rows)[columns].sort_values(["Ticker"]).reset_index(drop=True)
-
-
-def build_hourly_list(df_hourly: pd.DataFrame, daily_list_df: pd.DataFrame):
-    columns = [
-        "Ticker",
-        "Daily_AsOf",
-        "Daily_SwingLowDate",
-        "Daily_SwingLow",
-        "Hourly_LocalHighTime",
-        "Hourly_LocalHigh",
-        "Entry_61_8",
-        "Stop",
-        "TakeProfit",
-        "PullbackPct",
-        "LastClose",
-        "Triggered_LastBar",
-    ]
-
-    if daily_list_df.empty:
-        return pd.DataFrame(columns=columns)
-
-    rows = []
-    daily_lookup = daily_list_df.set_index("Ticker")
-
-    for ticker in daily_lookup.index:
-        drow = daily_lookup.loc[ticker]
-        group = df_hourly[df_hourly["Ticker"] == ticker].sort_values("DateTime")
-        if group.empty:
+        swing = _find_swing_as_of_quick(group, latest_date, lookback_days)
+        if swing is None:
             continue
 
-        window = group.tail(HOURS_LOOKBACK).copy()
-        highs = window["High"].to_numpy()
-        piv = pivot_highs(highs, look=HOURLY_PIVOT_LOOK)
+        post_high = group[(group["Date"] > swing["Swing High Date"]) & (group["Date"] <= latest_date)]
+        if (not post_high.empty) and (post_high["Low"] < swing["Stop Consider (78.6%)"]).any():
+            continue
 
-        if piv:
-            local_idx = piv[-1]
-            local_high = float(highs[local_idx])
-            local_high_time = pd.to_datetime(window.iloc[local_idx]["DateTime"])
-        else:
-            local_high = float(window["High"].max())
-            local_high_idx = window["High"].idxmax()
-            local_high_time = pd.to_datetime(window.loc[local_high_idx, "DateTime"])
+        retracement = (swing["Swing High Price"] - latest_price) / (swing["Swing High Price"] - swing["Swing Low Price"])
+        if retracement < 0.38:
+            continue
 
-        last_close = float(window["Close"].iloc[-1])
-        pullback_pct = (local_high - last_close) / local_high if local_high > 0 else np.nan
-        if pd.isna(pullback_pct):
-            pullback_pct = 0.0
-
-        fib_low = float(drow["SwingLow"])
-        entry = local_high - 0.618 * (local_high - fib_low)
-        stop = fib_low
-        take_profit = local_high
-
-        last_bar = window.iloc[-1]
-        triggered_last_bar = bool(last_bar["Low"] <= entry <= last_bar["High"])
+        retr_low_idx = post_high["Low"].idxmin()
+        retr_low_price = float(group.loc[retr_low_idx, "Low"])
+        retr_low_date = pd.to_datetime(group.loc[retr_low_idx, "Date"])
 
         rows.append(
             {
                 "Ticker": ticker,
-                "Daily_AsOf": pd.to_datetime(drow["AsOf"]),
-                "Daily_SwingLowDate": pd.to_datetime(drow["SwingLowDate"]),
-                "Daily_SwingLow": fib_low,
-                "Hourly_LocalHighTime": local_high_time,
-                "Hourly_LocalHigh": local_high,
-                "Entry_61_8": float(entry),
-                "Stop": float(stop),
-                "TakeProfit": float(take_profit),
-                "PullbackPct": float(pullback_pct),
-                "LastClose": last_close,
-                "Triggered_LastBar": triggered_last_bar,
+                "Latest Date": latest_date,
+                "Latest Price": latest_price,
+                "Swing Low Date": swing["Swing Low Date"],
+                "Swing Low Price": float(swing["Swing Low Price"]),
+                "Swing High Date": swing["Swing High Date"],
+                "Swing High Price": float(swing["Swing High Price"]),
+                "Swing Range": float(swing["Swing High Price"] - swing["Swing Low Price"]),
+                "Retracement": float(retracement),
+                "Daily Retracement Low Date": retr_low_date,
+                "Daily Retracement Low": retr_low_price,
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values("Ticker").reset_index(drop=True) if rows else pd.DataFrame()
+
+
+def build_hourly_hh_retrace_list(df_hourly: pd.DataFrame, daily_watch: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "Ticker",
+        "Daily Retracement Low Date",
+        "Daily Retracement Low",
+        "Hourly Local High Time",
+        "Hourly Local High",
+        "Higher High Confirmed",
+        "Retracing Now",
+        "Fib 61.8",
+        "Flagged 61.8%",
+        "Latest Hourly Close",
+    ]
+
+    if daily_watch.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows = []
+    lookup = daily_watch.set_index("Ticker")
+
+    for ticker in lookup.index:
+        drow = lookup.loc[ticker]
+        retr_low_date = pd.to_datetime(drow["Daily Retracement Low Date"])
+        daily_fib_low = float(drow["Daily Retracement Low"])
+
+        g = df_hourly[(df_hourly["Ticker"] == ticker) & (df_hourly["DateTime"] >= retr_low_date)].sort_values("DateTime")
+        if len(g) < 8:
+            continue
+
+        highs = g["High"].to_numpy()
+        piv = _pivot_high_indices(highs, look=HOURLY_PIVOT_LOOK)
+        if len(piv) < 2:
+            continue
+
+        hh_confirmed = any(highs[piv[i]] > highs[piv[i - 1]] for i in range(1, len(piv)))
+        if not hh_confirmed:
+            continue
+
+        local_high_idx = piv[-1]
+        local_high = float(highs[local_high_idx])
+        local_high_time = pd.to_datetime(g.iloc[local_high_idx]["DateTime"])
+
+        after_high = g.iloc[local_high_idx + 1 :].copy()
+        if after_high.empty:
+            retracing_now = False
+            latest_close = float(g["Close"].iloc[-1])
+            flagged_618 = False
+        else:
+            latest_close = float(after_high["Close"].iloc[-1])
+            retracing_now = (after_high["High"].max() <= local_high) and (latest_close < local_high)
+
+            fib_618 = local_high - 0.618 * (local_high - daily_fib_low)
+            flagged_618 = bool((after_high["Low"] <= fib_618).any())
+
+        fib_618 = local_high - 0.618 * (local_high - daily_fib_low)
+
+        rows.append(
+            {
+                "Ticker": ticker,
+                "Daily Retracement Low Date": retr_low_date,
+                "Daily Retracement Low": daily_fib_low,
+                "Hourly Local High Time": local_high_time,
+                "Hourly Local High": local_high,
+                "Higher High Confirmed": bool(hh_confirmed),
+                "Retracing Now": bool(retracing_now),
+                "Fib 61.8": float(fib_618),
+                "Flagged 61.8%": bool(flagged_618),
+                "Latest Hourly Close": latest_close,
             }
         )
 
     if not rows:
         return pd.DataFrame(columns=columns)
 
-    return pd.DataFrame(rows)[columns].sort_values(["Ticker"]).reset_index(drop=True)
+    return pd.DataFrame(rows)[columns].sort_values(["Flagged 61.8%", "Ticker"], ascending=[False, True]).reset_index(drop=True)
 
 
 def run_engine():
-    df_daily = load_all_market_data()
+    df_daily = load_all_market_data().copy()
     required_daily = {"Ticker", "Date", "Open", "High", "Low", "Close"}
     missing_daily = required_daily - set(df_daily.columns)
     if missing_daily:
-        raise ValueError(
-            f"load_all_market_data() missing required columns: {sorted(missing_daily)}. "
-            f"Found columns: {sorted(df_daily.columns.tolist())}"
-        )
+        raise ValueError(f"load_all_market_data() missing required columns: {sorted(missing_daily)}")
 
-    df_daily = df_daily.copy()
     df_daily["Date"] = pd.to_datetime(df_daily["Date"])
+    daily_list_df = build_watchlist(df_daily, lookback_days=LOOKBACK_DAYS)
 
-    daily_list_df = build_daily_list(df_daily)
-
-    df_hourly = load_all_market_data_hourly()
+    df_hourly = load_all_market_data_hourly().copy()
     required_hourly = {"Ticker", "DateTime", "Open", "High", "Low", "Close"}
     missing_hourly = required_hourly - set(df_hourly.columns)
     if missing_hourly:
-        raise ValueError(
-            f"load_all_market_data_hourly() missing required columns: {sorted(missing_hourly)}. "
-            f"Found columns: {sorted(df_hourly.columns.tolist())}"
-        )
+        raise ValueError(f"load_all_market_data_hourly() missing required columns: {sorted(missing_hourly)}")
 
-    df_hourly = df_hourly.copy()
     df_hourly["DateTime"] = pd.to_datetime(df_hourly["DateTime"])
-
-    hourly_list_df = build_hourly_list(df_hourly, daily_list_df)
+    hourly_list_df = build_hourly_hh_retrace_list(df_hourly, daily_list_df)
 
     return daily_list_df, hourly_list_df
