@@ -504,6 +504,7 @@ def build_hourly_entries(
     max_pullback_pct=0.12,
     near_entry_tol=0.02,
     max_bars_after_low=320,
+    min_bars_since_high=3,
 ):
     """
     Build hourly entry candidates from DAILY-qualified tickers (combined/List A).
@@ -559,6 +560,18 @@ def build_hourly_entries(
         if len(after_low) > max_bars_after_low:
             after_low = after_low.tail(max_bars_after_low).copy()
 
+        if len(after_low) <= min_bars_since_high:
+            rejects.append({"Ticker": ticker, "RejectReason": "high_too_recent"})
+            continue
+
+        eligible = after_low.iloc[:-min_bars_since_high]
+        if eligible.empty:
+            rejects.append({"Ticker": ticker, "RejectReason": "high_too_recent"})
+            continue
+
+        local_idx = eligible["High"].idxmax()
+        local_high = float(eligible.loc[local_idx, "High"])
+        local_high_time = pd.to_datetime(eligible.loc[local_idx, "DateTime"])
         local_idx = after_low["High"].idxmax()
         local_high = float(after_low.loc[local_idx, "High"])
         local_high_time = pd.to_datetime(after_low.loc[local_idx, "DateTime"])
