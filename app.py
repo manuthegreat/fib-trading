@@ -18,7 +18,7 @@ st.title("📈 Fib Retracement Dashboard")
 
 st.markdown("""
 ### What this app does
-This dashboard scans **all S&P 500, Hang Seng Index (HSI), and Straits Times Index (STI)** companies and identifies names that:
+This dashboard scans **all S&P 500, Hang Seng Index (HSI), and EURO STOXX 50** companies and identifies names that:
 
 - recently made a swing high  
 - are currently **retracing into Fibonacci support zones**  
