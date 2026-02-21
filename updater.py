@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import time
 from io import StringIO
+from datetime import timedelta
 from typing import Iterable, List, Optional
 
 import pandas as pd
@@ -319,6 +320,111 @@ def download_yahoo_prices(
     return frames
 
 
+def _period_to_timedelta(period: str) -> timedelta:
+    period = str(period).strip().lower()
+    if period.endswith("d"):
+        return timedelta(days=int(period[:-1]))
+    if period.endswith("mo"):
+        return timedelta(days=int(period[:-2]) * 30)
+    if period.endswith("y"):
+        return timedelta(days=int(period[:-1]) * 365)
+    # Fallback used when provider format differs (keep ~2 years by default)
+    return timedelta(days=730)
+
+
+def _download_single_stooq_ticker(
+    ticker: str,
+    period: str,
+    interval: str,
+    max_retries: int,
+    sleep_s: float,
+) -> Optional[pd.DataFrame]:
+    """
+    Stooq fallback for daily bars when Yahoo is unavailable/blocked.
+    """
+    if interval != "1d":
+        return None
+
+    symbol = ticker.strip().lower()
+    if not symbol:
+        return None
+
+    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+    cutoff = pd.Timestamp.utcnow().tz_localize(None) - _period_to_timedelta(period)
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.get(url, timeout=20)
+            r.raise_for_status()
+            df = pd.read_csv(StringIO(r.text))
+
+            required_cols = {"Date", "Open", "High", "Low", "Close"}
+            if df.empty or not required_cols.issubset(df.columns):
+                time.sleep(sleep_s * attempt)
+                continue
+
+            for col in ["Open", "High", "Low", "Close"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df = df.dropna(subset=["Date", "Open", "High", "Low", "Close"])
+            if df.empty:
+                time.sleep(sleep_s * attempt)
+                continue
+
+            df = df[df["Date"] >= cutoff]
+            if df.empty:
+                continue
+
+            return df.sort_values("Date").reset_index(drop=True)
+        except Exception:
+            time.sleep(sleep_s * attempt)
+
+    return None
+
+
+def download_stooq_prices(
+    tickers: List[str],
+    label: str,
+    period: str = "600d",
+    interval: str = "1d",
+    max_retries: int = 3,
+    sleep_s: float = 1.0,
+) -> List[pd.DataFrame]:
+    """
+    Downloads per-ticker OHLC from Stooq (daily only).
+    Returns list of DataFrames with Date/Ticker/Index columns aligned to Yahoo output.
+    """
+    frames: List[pd.DataFrame] = []
+    failed: List[str] = []
+
+    for ticker in tickers:
+        df_t = _download_single_stooq_ticker(
+            ticker=ticker,
+            period=period,
+            interval=interval,
+            max_retries=max_retries,
+            sleep_s=sleep_s,
+        )
+        if df_t is None or df_t.empty:
+            failed.append(ticker)
+            continue
+
+        df_t["Ticker"] = ticker
+        df_t["Index"] = label
+        frames.append(df_t)
+        time.sleep(sleep_s)
+
+    if failed:
+        print(
+            f"[WARN] Stooq returned no usable {interval} data for {len(failed)} "
+            f"{label} tickers: {', '.join(sorted(set(failed))[:20])}"
+            + (" ..." if len(set(failed)) > 20 else "")
+        )
+
+    return frames
+
+
 # ==========================================================
 # 3. MASTER FUNCTIONS
 # ==========================================================
@@ -334,6 +440,9 @@ def load_all_market_data() -> pd.DataFrame:
     sp_frames = download_yahoo_prices(sp500["Ticker"].tolist(), "SP500", period="600d", interval="1d")
     hs_frames = download_yahoo_prices(hsi["Ticker"].tolist(), "HSI", period="600d", interval="1d")
     eu_frames = download_yahoo_prices(euro["Ticker"].tolist(), "EUROSTOXX50", period="600d", interval="1d")
+    if not eu_frames:
+        print("[INFO] Yahoo returned no EURO STOXX 50 data; retrying with Stooq fallback")
+        eu_frames = download_stooq_prices(euro["Ticker"].tolist(), "EUROSTOXX50", period="600d", interval="1d")
 
     if not (sp_frames or hs_frames or eu_frames):
         raise RuntimeError("No DAILY OHLC data downloaded from Yahoo")
