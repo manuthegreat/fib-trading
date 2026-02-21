@@ -101,13 +101,17 @@ st.sidebar.write("Run this daily after market close / before open.")
 # -----------------------------
 # Cache Engine Run
 # -----------------------------
+ENGINE_VERSION = "2026-02-21-listb-debug-v2"
+
+
 @st.cache_data(show_spinner=True)
-def compute_dashboard():
-    df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df = run_engine()
-    return df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df
+def compute_dashboard(engine_version):
+    _ = engine_version
+    df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df, hourly_df = run_engine()
+    return df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df, hourly_df
 
 
-df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df = compute_dashboard()
+df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df, hourly_df = compute_dashboard(ENGINE_VERSION)
 
 if combined.empty:
     st.error("No names in watchlist / combined. Check data or parameters.")
@@ -149,16 +153,115 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
         "DailyRetrLowPrice",
         "local_high_time",
         "local_high",
-        "entry",
+        "entry_382",
+        "entry_50",
+        "entry_618",
         "stop",
         "take_profit",
         "last_close",
-        "pullback_pct",
-        "distance_to_entry_pct",
-        "entry_hit",
-        "retracing_now",
+        "retrace_from_high_pct",
+        "bars_since_high",
+        "distance_to_entry_618_pct",
+        "entry_618_hit",
     ]].copy()
-    st.dataframe(hourly_view, hide_index=True, use_container_width=True)
+
+    hourly_view = hourly_view.rename(
+        columns={
+            "DailyRetrLowDate": "Daily Low Date",
+            "DailyRetrLowPrice": "Daily Low",
+            "local_high_time": "Hourly High Time",
+            "local_high": "Hourly High",
+            "entry_382": "Entry 38.2%",
+            "entry_50": "Entry 50%",
+            "entry_618": "Entry 61.8%",
+            "take_profit": "Take Profit",
+            "last_close": "Last Close",
+            "retrace_from_high_pct": "Retrace % From High",
+            "bars_since_high": "Bars Since High",
+            "distance_to_entry_618_pct": "Distance to 61.8%",
+            "entry_618_hit": "61.8% Hit",
+        }
+    )
+
+    hourly_event = st.dataframe(
+        hourly_view,
+        hide_index=True,
+        use_container_width=True,
+        key="hourly_df",
+        on_select="rerun",
+        selection_mode="single-row",
+    )
+
+    hourly_selected_rows = []
+    if hourly_event is not None:
+        if hasattr(hourly_event, "selection") and hasattr(hourly_event.selection, "rows"):
+            hourly_selected_rows = hourly_event.selection.rows
+        elif hasattr(hourly_event, "rows"):
+            hourly_selected_rows = hourly_event.rows
+        elif isinstance(hourly_event, dict):
+            if "selection" in hourly_event and isinstance(hourly_event["selection"], dict):
+                hourly_selected_rows = hourly_event["selection"].get("rows", [])
+            else:
+                hourly_selected_rows = hourly_event.get("rows", [])
+
+    if "hourly_selected_ticker" not in st.session_state:
+        st.session_state.hourly_selected_ticker = None
+
+    if hourly_selected_rows:
+        hourly_selected_idx = hourly_selected_rows[0]
+        st.session_state.hourly_selected_ticker = hourly_entries_df.iloc[hourly_selected_idx]["Ticker"]
+
+    hourly_ticker_selected = st.session_state.hourly_selected_ticker
+
+    if hourly_ticker_selected and hourly_df is not None and not hourly_df.empty:
+        selected_hourly_row = hourly_entries_df[hourly_entries_df["Ticker"] == hourly_ticker_selected]
+        ticker_hourly = hourly_df[hourly_df["Ticker"] == hourly_ticker_selected].copy()
+
+        if (not selected_hourly_row.empty) and (not ticker_hourly.empty):
+            hrow = selected_hourly_row.iloc[0]
+            ticker_hourly["DateTime"] = pd.to_datetime(ticker_hourly["DateTime"], errors="coerce")
+            ticker_hourly = ticker_hourly.dropna(subset=["DateTime"]).sort_values("DateTime").tail(240)
+
+            fig_hourly = go.Figure(
+                data=[
+                    go.Candlestick(
+                        x=ticker_hourly["DateTime"],
+                        open=ticker_hourly["Open"],
+                        high=ticker_hourly["High"],
+                        low=ticker_hourly["Low"],
+                        close=ticker_hourly["Close"],
+                        name=hourly_ticker_selected,
+                    )
+                ]
+            )
+
+            level_specs = [
+                ("entry_382", "Entry 38.2%", "#1f77b4"),
+                ("entry_50", "Entry 50%", "#9467bd"),
+                ("entry_618", "Entry 61.8%", "#ff7f0e"),
+                ("stop", "Stop", "#d62728"),
+                ("take_profit", "Take Profit", "#2ca02c"),
+            ]
+
+            for col, label, color in level_specs:
+                if col in hrow and pd.notna(hrow[col]):
+                    fig_hourly.add_hline(
+                        y=float(hrow[col]),
+                        line_dash="dash",
+                        line_color=color,
+                        annotation_text=label,
+                        annotation_position="top left",
+                    )
+
+            fig_hourly.update_layout(
+                title=f"{hourly_ticker_selected} – Hourly (List B)",
+                xaxis_title="DateTime",
+                yaxis_title="Price",
+                xaxis_rangeslider_visible=False,
+                template="plotly_white",
+                height=500,
+            )
+            st.plotly_chart(fig_hourly, use_container_width=True)
 else:
     st.info("No hourly entry candidates found for current run.")
 
