@@ -149,15 +149,35 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
         "DailyRetrLowPrice",
         "local_high_time",
         "local_high",
-        "entry",
+        "entry_382",
+        "entry_50",
+        "entry_618",
         "stop",
         "take_profit",
         "last_close",
-        "pullback_pct",
-        "distance_to_entry_pct",
-        "entry_hit",
-        "retracing_now",
+        "retrace_from_high_pct",
+        "bars_since_high",
+        "distance_to_entry_618_pct",
+        "entry_618_hit",
     ]].copy()
+
+    hourly_view = hourly_view.rename(
+        columns={
+            "DailyRetrLowDate": "Daily Low Date",
+            "DailyRetrLowPrice": "Daily Low",
+            "local_high_time": "Hourly High Time",
+            "local_high": "Hourly High",
+            "entry_382": "Entry 38.2%",
+            "entry_50": "Entry 50%",
+            "entry_618": "Entry 61.8%",
+            "take_profit": "Take Profit",
+            "last_close": "Last Close",
+            "retrace_from_high_pct": "Retrace % From High",
+            "bars_since_high": "Bars Since High",
+            "distance_to_entry_618_pct": "Distance to 61.8%",
+            "entry_618_hit": "61.8% Hit",
+        }
+    )
     st.dataframe(hourly_view, hide_index=True, use_container_width=True)
 else:
     st.info("No hourly entry candidates found for current run.")
