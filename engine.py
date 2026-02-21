@@ -611,6 +611,11 @@ def build_hourly_entries(
         if local_window.empty:
             rejects.append({"Ticker": ticker, "RejectReason": "invalid_impulse_window"})
             continue
+
+
+        if local_window.empty:
+            rejects.append({"Ticker": ticker, "RejectReason": "invalid_impulse_window"})
+            continue
         if len(after_low) <= min_bars_since_high:
             rejects.append({"Ticker": ticker, "RejectReason": "high_too_recent"})
             continue
@@ -1318,6 +1323,7 @@ def run_engine():
     - insight_df: subset of combined with non-empty INSIGHT_TAGS
     - hourly_entries_df: hourly entry candidates built from combined tickers
     - hourly_rejects_df: hourly rejects diagnostics
+    - hourly_df: full hourly OHLC dataframe used for List B charting
     """
     df = load_all_market_data()
     watch = build_watchlist(df, lookback_days=LOOKBACK_DAYS)
@@ -1325,7 +1331,7 @@ def run_engine():
     if watch.empty:
         combined = pd.DataFrame()
         insight_df = pd.DataFrame()
-        return df, combined, insight_df, pd.DataFrame(), pd.DataFrame()
+        return df, combined, insight_df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     # Enhance watchlist
     watch["Retracement %"] = watch["Retracement"] * 100
@@ -1390,7 +1396,7 @@ def run_engine():
     if watch.empty:
         combined = pd.DataFrame()
         insight_df = pd.DataFrame()
-        return df, combined, insight_df, pd.DataFrame(), pd.DataFrame()
+        return df, combined, insight_df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     # CONFIRMATION
     confirm = confirmation_engine(df, watch)
@@ -1457,6 +1463,7 @@ def run_engine():
     except Exception as exc:
         import traceback
 
+        hourly_df = pd.DataFrame()
         hourly_entries_df = pd.DataFrame()
         hourly_rejects_df = pd.DataFrame(
             [
@@ -1469,4 +1476,4 @@ def run_engine():
             ]
         )
 
-    return df, combined, insight_df, hourly_entries_df, hourly_rejects_df
+    return df, combined, insight_df, hourly_entries_df, hourly_rejects_df, hourly_df
