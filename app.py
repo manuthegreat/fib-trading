@@ -41,57 +41,12 @@ st.markdown(hide_sidebar, unsafe_allow_html=True)
 # ---------------------------------------------------------
 st.sidebar.header("Settings")
 
-min_readiness = st.sidebar.slider(
-    "Min Readiness Score",
-    min_value=0,
-    max_value=100,
-    value=0,
-    step=1,
-)
-
-min_pressure = st.sidebar.slider(
-    "Min Breakout Pressure",
-    min_value=0,
-    max_value=100,
-    value=0,
-    step=1,
-)
-
-show_only_insights = st.sidebar.checkbox(
-    "Show only insight names (INSIGHT_TAGS != '')",
-    value=False,
-)
-
 lookback_days = st.sidebar.slider(
     "Chart lookback (days)",
     min_value=60,
     max_value=500,
     value=180,
     step=10,
-)
-
-# -----------------------------
-# Insight Tag Filter
-# -----------------------------
-st.sidebar.subheader("Filter by Insight Tags")
-
-INSIGHT_OPTIONS = [
-    "🔥 PRIME",
-    "⚡ BOS_IMMINENT",
-    "🎯 PERFECT_ENTRY",
-    "🌀 STRUCTURE_STRONG",
-    "📉 SQUEEZE",
-    "💥 MACD_THRUST",
-    "📈 EARLY_BOS",
-    "🔋 ENERGY_BUILDUP",
-    "🔄 REVERSAL_CONFIRM",
-    "🛑 EXTENDED",
-]
-
-selected_insights = st.sidebar.multiselect(
-    "Show tickers with any selected tags:",
-    INSIGHT_OPTIONS,
-    default=[],
 )
 
 st.sidebar.write("---")
@@ -101,7 +56,7 @@ st.sidebar.write("Run this daily after market close / before open.")
 # -----------------------------
 # Cache Engine Run
 # -----------------------------
-ENGINE_VERSION = "2026-02-21-listb-debug-v2"
+ENGINE_VERSION = "2026-02-21-ui-cleanup-v1"
 
 
 @st.cache_data(show_spinner=True)
@@ -126,22 +81,10 @@ if combined.empty:
 
 
 # ---------------------------------------------------------
-# Apply Basic Filters
+# Daily list uses combined output directly to preserve existing ticker selection/ranking.
+# Removed only UI-level filters whose defaults were non-restrictive (0 / unchecked).
 # ---------------------------------------------------------
 df_view = combined.copy()
-df_view = df_view[df_view["READINESS_SCORE"] >= min_readiness]
-df_view = df_view[df_view["BREAKOUT_PRESSURE"] >= min_pressure]
-
-if show_only_insights:
-    df_view = df_view[df_view["INSIGHT_TAGS"] != ""]
-
-# Apply insight tag filtering
-if selected_insights:
-    df_view = df_view[
-        df_view["INSIGHT_TAGS"].apply(
-            lambda tags: any(tag in tags for tag in selected_insights)
-        )
-    ]
 
 if df_view.empty:
     st.warning("No tickers match current filters.")
@@ -152,25 +95,6 @@ if df_view.empty:
 # Hourly Entry Candidates (List B)
 # ---------------------------------------------------------
 st.write("### Hourly Entry Candidates (List B)")
-
-
-# Debug visibility for List B build pipeline
-st.write("#### List B Debug")
-st.caption(
-    f"Combined tickers: {len(combined)} | Hourly entries: {len(hourly_entries_df)} | Hourly rejects: {len(hourly_rejects_df)}"
-)
-
-if hourly_rejects_df is not None and not hourly_rejects_df.empty:
-    st.write("Reject reasons (counts)")
-    st.dataframe(
-        hourly_rejects_df["RejectReason"].value_counts().rename_axis("RejectReason").reset_index(name="count"),
-        hide_index=True,
-        use_container_width=True,
-    )
-    st.write("Reject rows")
-    st.dataframe(hourly_rejects_df, hide_index=True, use_container_width=True)
-else:
-    st.info("No hourly rejects for this run.")
 
 if hourly_entries_df is not None and not hourly_entries_df.empty:
     hourly_view = hourly_entries_df[[
@@ -288,7 +212,6 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
                 height=500,
             )
             st.plotly_chart(fig_hourly, use_container_width=True)
-    st.dataframe(hourly_view, hide_index=True, use_container_width=True)
 else:
     st.info("No hourly entry candidates found for current run.")
 
@@ -315,15 +238,17 @@ st.write("### Ranked Dashboard (Filtered)")
 ranked_table = df_view[
     [
         "Ticker",
-        "FINAL_SIGNAL",
-        "Shape",
-        "BREAKOUT_PRESSURE",
-        "PERFECT_ENTRY",
-        "READINESS_SCORE",
-        "INSIGHT_TAGS",
-        "NEXT_ACTION",
+        "SwingHigh",
+        "SwingLow",
+        "Latest Price",
     ]
 ].reset_index(drop=True)
+
+swing_range = (ranked_table["SwingHigh"] - ranked_table["SwingLow"]).replace(0, pd.NA)
+ranked_table["Current Retracement %"] = (
+    (ranked_table["SwingHigh"] - ranked_table["Latest Price"]) / swing_range
+) * 100
+ranked_table = ranked_table.drop(columns=["Latest Price"])
 
 event = st.dataframe(
     ranked_table,
