@@ -1,7 +1,7 @@
 """
 updater.py  (simple, Streamlit-friendly version)
 
-✓ Builds SP500, HSI, STI universes
+✓ Builds SP500, HSI, EURO STOXX 50 universes
 ✓ Downloads last 600 days of OHLC from Yahoo
 ✓ Batches requests with yf.download (no manual threads)
 ✓ Returns ONE CLEAN MERGED DATAFRAME
@@ -90,41 +90,49 @@ def get_hsi_universe():
     return df[["Ticker", "Name", "Sector"]]
 
 
-def get_sti_universe():
-    data = [
-        ("D05.SI", "DBS Group Holdings", "Financials"),
-        ("U11.SI", "United Overseas Bank", "Financials"),
-        ("O39.SI", "Oversea-Chinese Banking Corporation", "Financials"),
-        ("C07.SI", "Jardine Matheson", "Conglomerate"),
-        ("C09.SI", "City Developments", "Real Estate"),
-        ("C38U.SI", "CapitaLand Integrated Commercial Trust", "Real Estate"),
-        ("C52.SI", "ComfortDelGro", "Transportation"),
-        ("F34.SI", "Frasers Logistics & Commercial Trust", "Real Estate"),
-        ("G13.SI", "Genting Singapore", "Entertainment"),
-        ("H78.SI", "Hongkong Land", "Real Estate"),
-        ("J36.SI", "Jardine Cycle & Carriage", "Industrial"),
-        ("M44U.SI", "Mapletree Logistics Trust", "Real Estate"),
-        ("ME8U.SI", "Mapletree Industrial Trust", "Real Estate"),
-        ("N2IU.SI", "NetLink NBN Trust", "Utilities"),
-        ("S63.SI", "Singapore Airlines", "Transportation"),
-        ("S68.SI", "Singapore Exchange", "Financials"),
-        ("S58.SI", "Sembcorp Industries", "Utilities"),
-        ("U96.SI", "SATS Ltd", "Services"),
-        ("S07.SI", "Singapore Technologies Engineering", "Industrial"),
-        ("Z74.SI", "Singtel", "Telecom"),
-        ("BN4.SI", "Keppel Corporation", "Industrial"),
-        ("M01.SI", "Micro-Mechanics", "Industrial"),
-        ("A17U.SI", "CapitaLand Ascendas REIT", "Real Estate"),
-        ("BS6.SI", "Yangzijiang Shipbuilding", "Industrial"),
-        ("C31.SI", "CapitaLand Investment", "Real Estate"),
-        ("E5H.SI", "Emperador Inc", "Consumer Staples"),
-        ("5DP.SI", "Delfi Limited", "Consumer Goods"),
-        ("D01.SI", "Dairy Farm International", "Consumer Staples"),
-        ("K71U.SI", "Keppel DC REIT", "Real Estate"),
-        ("H78.SI", "Hongkong Land Holdings", "Real Estate"),
-    ]
+def get_eurostoxx50_universe():
+    """
+    Scrapes EURO STOXX 50 constituents from Wikipedia.
+    The Composition table includes a 'Ticker' column already in Yahoo-friendly format
+    (e.g., ADS.DE, AI.PA, ADYEN.AS, ...). :contentReference[oaicite:1]{index=1}
+    """
+    url = "https://en.wikipedia.org/wiki/EURO_STOXX_50"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers, timeout=15)
 
-    return pd.DataFrame(data, columns=["Ticker", "Name", "Sector"])
+    tables = pd.read_html(StringIO(r.text))
+
+    df = None
+    for t in tables:
+        cols = [str(c).strip().lower() for c in t.columns]
+        # The constituent table typically has these columns
+        if "ticker" in cols and "name" in cols:
+            df = t.copy()
+            break
+
+    if df is None:
+        raise RuntimeError("Could not find EURO STOXX 50 constituents table on Wikipedia")
+
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Normalize expected columns
+    # Typical: Ticker | Main listing | Name | ... | Sector | ...
+    if "Ticker" not in df.columns or "Name" not in df.columns:
+        raise RuntimeError(f"EURO STOXX 50 table missing expected columns. Found: {list(df.columns)}")
+
+    # Sector might be present; if not, keep None
+    sector_col = "Sector" if "Sector" in df.columns else None
+
+    out = pd.DataFrame({
+        "Ticker": df["Ticker"].astype(str).str.strip(),
+        "Name": df["Name"].astype(str).str.strip(),
+        "Sector": df[sector_col].astype(str).str.strip() if sector_col else None,
+    })
+
+    out = out.dropna(subset=["Ticker"])
+    out = out[out["Ticker"] != ""].reset_index(drop=True)
+
+    return out[["Ticker", "Name", "Sector"]]
 
 
 # ==========================================================
@@ -165,7 +173,6 @@ def download_yahoo_prices(tickers, label, period="600d", interval="1d"):
             failed.extend(batch)
             continue
 
-        # For a multi-ticker request, yfinance returns a column MultiIndex
         for t in batch:
             try:
                 df_t = data[t].dropna().copy()
@@ -186,31 +193,28 @@ def download_yahoo_prices(tickers, label, period="600d", interval="1d"):
 
 def load_all_market_data():
     """
-    Returns a merged OHLC dataframe for SP500 + HSI + STI
+    Returns a merged OHLC dataframe for SP500 + HSI + EURO STOXX 50
     without saving anything to disk.
     """
     print("Building universes...")
 
     sp500 = get_sp500_universe()
     hsi = get_hsi_universe()
-    sti = get_sti_universe()
+    es50 = get_eurostoxx50_universe()
 
     print("SP500:", len(sp500))
     print("HSI:  ", len(hsi))
-    print("STI:  ", len(sti))
+    print("ES50: ", len(es50))
 
-    # Download last ~600 days of data
     sp = download_yahoo_prices(sp500["Ticker"].tolist(), "SP500", period="600d")
-    hs = download_yahoo_prices(hsi["Ticker"].tolist(), "HSI",   period="600d")
-    st = download_yahoo_prices(sti["Ticker"].tolist(), "STI",   period="600d")
+    hs = download_yahoo_prices(hsi["Ticker"].tolist(),   "HSI",   period="600d")
+    es = download_yahoo_prices(es50["Ticker"].tolist(),  "ES50",  period="600d")
 
-    if not (sp or hs or st):
+    if not (sp or hs or es):
         raise RuntimeError("No OHLC data downloaded from Yahoo")
 
-    combined = pd.concat(sp + hs + st, ignore_index=True)
+    combined = pd.concat(sp + hs + es, ignore_index=True)
 
-    # Ensure standard columns
-    combined.rename(columns={"Date": "Date"}, inplace=True)
     combined["Date"] = pd.to_datetime(combined["Date"])
     combined = combined.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
@@ -220,23 +224,23 @@ def load_all_market_data():
 
 def load_all_market_data_hourly():
     """
-    Returns merged hourly OHLC dataframe for SP500 + HSI + STI.
+    Returns merged hourly OHLC dataframe for SP500 + HSI + EURO STOXX 50.
     Output columns include: Ticker, DateTime, Open, High, Low, Close.
     """
     print("Building universes for hourly data...")
 
     sp500 = get_sp500_universe()
     hsi = get_hsi_universe()
-    sti = get_sti_universe()
+    es50 = get_eurostoxx50_universe()
 
     sp = download_yahoo_prices(sp500["Ticker"].tolist(), "SP500", period="60d", interval="60m")
-    hs = download_yahoo_prices(hsi["Ticker"].tolist(), "HSI", period="60d", interval="60m")
-    st = download_yahoo_prices(sti["Ticker"].tolist(), "STI", period="60d", interval="60m")
+    hs = download_yahoo_prices(hsi["Ticker"].tolist(),   "HSI",   period="60d", interval="60m")
+    es = download_yahoo_prices(es50["Ticker"].tolist(),  "ES50",  period="60d", interval="60m")
 
-    if not (sp or hs or st):
+    if not (sp or hs or es):
         raise RuntimeError("No hourly OHLC data downloaded from Yahoo")
 
-    combined = pd.concat(sp + hs + st, ignore_index=True)
+    combined = pd.concat(sp + hs + es, ignore_index=True)
 
     datetime_col = "Datetime" if "Datetime" in combined.columns else "Date"
     if datetime_col not in combined.columns:
