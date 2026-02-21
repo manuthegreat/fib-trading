@@ -179,6 +179,45 @@ def _chunk(lst: List[str], n: int) -> List[List[str]]:
     return [lst[i:i + n] for i in range(0, len(lst), n)]
 
 
+def _download_single_ticker(
+    ticker: str,
+    period: str,
+    interval: str,
+    max_retries: int,
+    sleep_s: float,
+) -> Optional[pd.DataFrame]:
+    """
+    Single-name fallback download used when a batch call returns partial/empty data.
+    """
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            data = yf.download(
+                tickers=ticker,
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                threads=False,
+                progress=False,
+            )
+            if data is None or data.empty:
+                time.sleep(sleep_s * attempt)
+                continue
+
+            return data.dropna().copy()
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(sleep_s * attempt)
+
+    if last_exc is not None:
+        print(f"[WARN] Yahoo single download failed for {ticker}: {last_exc}")
+    else:
+        print(f"[WARN] Yahoo single download returned no data for {ticker}")
+
+    return None
+
+
 def download_yahoo_prices(
     tickers: List[str],
     label: str,
@@ -198,6 +237,7 @@ def download_yahoo_prices(
         return []
 
     frames: List[pd.DataFrame] = []
+    failed_tickers: List[str] = []
 
     for batch in _chunk(tickers, batch_size):
         last_exc = None
@@ -221,16 +261,21 @@ def download_yahoo_prices(
                 time.sleep(sleep_s * attempt)
 
         if last_exc is not None:
-            # Skip this batch; we keep going so the app still works.
-            continue
+            print(f"[WARN] Yahoo batch download failed ({label}) for {batch}: {last_exc}")
+            data = pd.DataFrame()
 
         # yfinance output format differs for 1 ticker vs many tickers
+        found_in_batch = set()
         for t in batch:
             try:
                 if isinstance(data.columns, pd.MultiIndex):
+                    if t not in data.columns.get_level_values(0):
+                        continue
                     df_t = data[t].dropna().copy()
                 else:
                     # single-ticker download returns flat columns
+                    if len(batch) != 1:
+                        continue
                     df_t = data.dropna().copy()
 
                 if df_t.empty:
@@ -239,10 +284,37 @@ def download_yahoo_prices(
                 df_t["Ticker"] = t
                 df_t["Index"] = label
                 frames.append(df_t.reset_index())
+                found_in_batch.add(t)
             except Exception:
                 continue
 
+        # Fallback: retry missing names as single downloads so one bad symbol
+        # does not poison an entire batch (common with Yahoo non-US coverage).
+        missing = [t for t in batch if t not in found_in_batch]
+        for t in missing:
+            df_t = _download_single_ticker(
+                ticker=t,
+                period=period,
+                interval=interval,
+                max_retries=max_retries,
+                sleep_s=sleep_s,
+            )
+            if df_t is None or df_t.empty:
+                failed_tickers.append(t)
+                continue
+
+            df_t["Ticker"] = t
+            df_t["Index"] = label
+            frames.append(df_t.reset_index())
+
         time.sleep(sleep_s)
+
+    if failed_tickers:
+        print(
+            f"[WARN] Yahoo returned no usable {interval} data for {len(failed_tickers)} "
+            f"{label} tickers: {', '.join(sorted(set(failed_tickers))[:20])}"
+            + (" ..." if len(set(failed_tickers)) > 20 else "")
+        )
 
     return frames
 
