@@ -540,6 +540,10 @@ def build_hourly_entries(
     _ = min_pullback_pct
     _ = max_pullback_pct
     _ = min_bars_since_high
+    # Kept for signature stability; hourly inclusion no longer depends on these checks.
+    _ = near_entry_tol
+    _ = pivot_look
+    _ = min_hh_count
 
     hourly = hourly_df.copy()
     hourly["DateTime"] = pd.to_datetime(hourly["DateTime"], errors="coerce")
@@ -608,6 +612,42 @@ def build_hourly_entries(
             rejects.append({"Ticker": ticker, "RejectReason": "invalid_impulse_window"})
             continue
 
+
+        impulse_indices = after_low.index[impulse_mask.fillna(False)]
+        if len(impulse_indices) == 0:
+            rejects.append({"Ticker": ticker, "RejectReason": "no_impulse_bar"})
+            continue
+
+        impulse_idx = impulse_indices[-1]
+        impulse_pos = after_low.index.get_loc(impulse_idx)
+        window_start = max(0, impulse_pos - 1)
+        window_end = min(len(after_low), impulse_pos + 2)
+        local_window = after_low.iloc[window_start:window_end]
+
+        if local_window.empty:
+            rejects.append({"Ticker": ticker, "RejectReason": "invalid_impulse_window"})
+            continue
+
+
+        if local_window.empty:
+            rejects.append({"Ticker": ticker, "RejectReason": "invalid_impulse_window"})
+            continue
+        if len(after_low) <= min_bars_since_high:
+            rejects.append({"Ticker": ticker, "RejectReason": "high_too_recent"})
+            continue
+
+        eligible = after_low.iloc[:-min_bars_since_high]
+        if eligible.empty:
+            rejects.append({"Ticker": ticker, "RejectReason": "high_too_recent"})
+            continue
+
+        local_idx = eligible["High"].idxmax()
+        local_high = float(eligible.loc[local_idx, "High"])
+        local_high_time = pd.to_datetime(eligible.loc[local_idx, "DateTime"])
+        local_idx = after_low["High"].idxmax()
+        local_high = float(after_low.loc[local_idx, "High"])
+        local_high_time = pd.to_datetime(after_low.loc[local_idx, "DateTime"])
+
         local_idx = local_window["High"].idxmax()
         local_high = float(local_window.loc[local_idx, "High"])
         local_high_time = pd.to_datetime(local_window.loc[local_idx, "DateTime"])
@@ -625,6 +665,19 @@ def build_hourly_entries(
         currently_pulling_back = (last_close < local_high) and (last_close < previous_close)
         if not currently_pulling_back:
             rejects.append({"Ticker": ticker, "RejectReason": "not_currently_pulling_back"})
+        bars_since_high = int((after_low["DateTime"] > local_high_time).sum())
+        if bars_since_high < 3:
+            rejects.append({"Ticker": ticker, "RejectReason": "high_too_recent"})
+            continue
+
+        retrace_from_high_pct = (local_high - last_close) / local_high
+        retracing_now = (
+            (last_close < local_high)
+            and (retrace_from_high_pct >= min_pullback_pct)
+            and (retrace_from_high_pct <= max_pullback_pct)
+        )
+        if not retracing_now:
+            rejects.append({"Ticker": ticker, "RejectReason": "no_pullback"})
             continue
 
         fib_low = retr_low_price
@@ -643,6 +696,8 @@ def build_hourly_entries(
         distance_to_entry_618_pct = (last_close - entry_618) / entry_618
         entry_618_hit = (last_low <= entry_618) and (entry_618 <= last_high)
         bars_since_high = int((after_low["DateTime"] > local_high_time).sum())
+        distance_to_entry_618_pct = (last_close - entry_618) / entry_618
+        entry_618_hit = (last_low <= entry_618) and (entry_618 <= last_high)
 
         entries.append(
             {
