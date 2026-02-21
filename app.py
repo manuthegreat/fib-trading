@@ -112,6 +112,11 @@ def compute_dashboard(engine_version):
 
 
 df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df, hourly_df = compute_dashboard(ENGINE_VERSION)
+    df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df = run_engine()
+    return df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df
+
+
+df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df = compute_dashboard(ENGINE_VERSION)
 
 if combined.empty:
     st.error("No names in watchlist / combined. Check data or parameters.")
@@ -145,6 +150,25 @@ if df_view.empty:
 # Hourly Entry Candidates (List B)
 # ---------------------------------------------------------
 st.write("### Hourly Entry Candidates (List B)")
+
+
+# Debug visibility for List B build pipeline
+st.write("#### List B Debug")
+st.caption(
+    f"Combined tickers: {len(combined)} | Hourly entries: {len(hourly_entries_df)} | Hourly rejects: {len(hourly_rejects_df)}"
+)
+
+if hourly_rejects_df is not None and not hourly_rejects_df.empty:
+    st.write("Reject reasons (counts)")
+    st.dataframe(
+        hourly_rejects_df["RejectReason"].value_counts().rename_axis("RejectReason").reset_index(name="count"),
+        hide_index=True,
+        use_container_width=True,
+    )
+    st.write("Reject rows")
+    st.dataframe(hourly_rejects_df, hide_index=True, use_container_width=True)
+else:
+    st.info("No hourly rejects for this run.")
 
 if hourly_entries_df is not None and not hourly_entries_df.empty:
     hourly_view = hourly_entries_df[[
@@ -262,6 +286,7 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
                 height=500,
             )
             st.plotly_chart(fig_hourly, use_container_width=True)
+    st.dataframe(hourly_view, hide_index=True, use_container_width=True)
 else:
     st.info("No hourly entry candidates found for current run.")
 
