@@ -15,29 +15,64 @@ import yfinance as yf
 
 
 # ==========================================================
+# Helpers
+# ==========================================================
+def _flatten_columns(cols) -> list[str]:
+    """
+    pd.read_html can return MultiIndex columns if the HTML table has multi-row headers.
+    This flattens columns into readable strings.
+    """
+    out = []
+    for c in cols:
+        if isinstance(c, tuple):
+            parts = [str(x).strip() for x in c if str(x).strip() and str(x).strip().lower() != "nan"]
+            out.append(" ".join(parts).strip())
+        else:
+            out.append(str(c).strip())
+    return out
+
+
+def _find_col(df: pd.DataFrame, contains: list[str]) -> str | None:
+    """
+    Find the first column whose lowercase name contains ALL substrings in `contains`.
+    """
+    cols = _flatten_columns(df.columns)
+    for col in cols:
+        low = col.lower()
+        if all(s in low for s in contains):
+            return col
+    return None
+
+
+def _read_html_tables(url: str, headers: dict, timeout: int = 15) -> list[pd.DataFrame]:
+    r = requests.get(url, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return pd.read_html(StringIO(r.text))
+
+
+# ==========================================================
 # 1. UNIVERSE BUILDERS
 # ==========================================================
-
 def get_sp500_universe():
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, headers=headers, timeout=15)
-    r.raise_for_status()
 
-    tables = pd.read_html(StringIO(r.text))
+    tables = _read_html_tables(url, headers=headers, timeout=15)
 
     df = None
     for t in tables:
-        if "Symbol" in t.columns:
+        cols = _flatten_columns(t.columns)
+        if any(c.strip().lower() == "symbol" for c in cols):
             df = t.copy()
+            df.columns = cols
             break
 
     if df is None:
         raise RuntimeError("Could not find S&P500 table on Wikipedia")
 
-    df["Ticker"] = df["Symbol"].astype(str).str.replace(".", "-", regex=False)
-    df["Name"] = df["Security"].astype(str)
-    df["Sector"] = df["GICS Sector"].astype(str)
+    df["Ticker"] = df["Symbol"].astype(str).str.replace(".", "-", regex=False).str.strip()
+    df["Name"] = df["Security"].astype(str).str.strip()
+    df["Sector"] = df["GICS Sector"].astype(str).str.strip()
 
     return df[["Ticker", "Name", "Sector"]]
 
@@ -45,220 +80,182 @@ def get_sp500_universe():
 def get_hsi_universe():
     url = "https://en.wikipedia.org/wiki/Hang_Seng_Index"
     headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, headers=headers, timeout=15)
-    r.raise_for_status()
 
-    tables = pd.read_html(StringIO(r.text))
+    tables = _read_html_tables(url, headers=headers, timeout=15)
 
     df = None
     for t in tables:
-        cols = [str(c).lower() for c in t.columns]
-        if any(x in cols for x in ["ticker", "constituent", "sub-index", "sub index", "code"]):
+        cols = [c.lower() for c in _flatten_columns(t.columns)]
+        # try to find the constituents table
+        if any("ticker" in c or "code" in c or "sehk" in c for c in cols) and any("name" in c or "constitu" in c for c in cols):
             df = t.copy()
+            df.columns = _flatten_columns(df.columns)
             break
 
     if df is None:
-        raise RuntimeError("Could not find HSI table on Wikipedia")
+        raise RuntimeError("Could not find HSI constituents table on Wikipedia")
 
-    df.columns = [str(c).lower() for c in df.columns]
-
+    # find ticker-like column
     ticker_col = None
     for c in df.columns:
-        if "sehk" in c or "ticker" in c or "code" in c:
+        cl = c.lower()
+        if "sehk" in cl or "ticker" in cl or "code" in cl:
             ticker_col = c
             break
-
     if ticker_col is None:
         raise RuntimeError("Could not find ticker column for HSI")
+
+    # find name-like column
+    name_col = None
+    for c in df.columns:
+        cl = c.lower()
+        if c != ticker_col and ("name" in cl or "constitu" in cl or "company" in cl):
+            name_col = c
+            break
+    if name_col is None:
+        # fallback: first non-ticker col
+        name_col = [c for c in df.columns if c != ticker_col][0]
 
     df["Ticker"] = (
         df[ticker_col]
         .astype(str)
         .str.extract(r"(\d+)", expand=False)
+        .fillna("")
         .astype(str)
         .str.zfill(4)
         + ".HK"
     )
+    df["Name"] = df[name_col].astype(str).str.strip()
 
-    if "name" in df.columns:
-        name_col = "name"
-    else:
-        possible = [c for c in df.columns if c != ticker_col]
-        name_col = possible[0] if possible else ticker_col
+    # optional sector/sub-index if present
+    sector_col = None
+    for c in df.columns:
+        cl = c.lower()
+        if "sub-index" in cl or "industry" in cl or "sector" in cl:
+            sector_col = c
+            break
+    df["Sector"] = df[sector_col].astype(str).str.strip() if sector_col else None
 
-    df["Name"] = df[name_col].astype(str)
-    df["Sector"] = df.get("sub-index", df.get("sub index", df.get("industry", None)))
-
+    df = df[df["Ticker"].str.len() > 3].reset_index(drop=True)
     return df[["Ticker", "Name", "Sector"]]
 
 
 def get_eurostoxx50_universe():
     """
-    Scrape Euro Stoxx 50 constituents from Wikipedia and map them to Yahoo symbols
-    by using Exchange/Country columns to append the correct Yahoo suffix.
+    Wikipedia already lists Yahoo-friendly tickers like ADS.DE, SAN.PA, ASML.AS, etc.
+    The key fix is handling multi-row headers -> MultiIndex columns.
     """
     url = "https://en.wikipedia.org/wiki/EURO_STOXX_50"
     headers = {"User-Agent": "Mozilla/5.0"}
 
-    r = requests.get(url, headers=headers, timeout=15)
-    r.raise_for_status()
+    tables = _read_html_tables(url, headers=headers, timeout=15)
 
-    tables = pd.read_html(StringIO(r.text))
-
-    # Find a constituents table. Wikipedia formatting changes; be flexible.
     table = None
+    ticker_col = None
+    name_col = None
+    sector_col = None
+
     for t in tables:
-        cols = [str(c).strip().lower() for c in t.columns]
-        has_ticker = any(c in cols for c in ["ticker", "symbol"])
-        has_name = any(c in cols for c in ["name", "company"])
-        if has_ticker and has_name:
-            table = t.copy()
+        tmp = t.copy()
+        tmp.columns = _flatten_columns(tmp.columns)
+
+        # We want the "Composition" constituents table. It has Ticker + Name.
+        tc = _find_col(tmp, ["ticker"])
+        nc = _find_col(tmp, ["name"])
+        if tc and nc:
+            table = tmp
+            ticker_col = tc
+            name_col = nc
+            sector_col = _find_col(tmp, ["sector"])
             break
 
     if table is None:
-        raise RuntimeError("EURO STOXX 50 scrape failed: could not find a constituents table with ticker + name/company")
+        raise RuntimeError("EURO STOXX 50 scrape failed: could not find table with Ticker + Name columns")
 
-    # Normalize columns (keep original casing for later, but build lookup)
-    colmap = {str(c).strip().lower(): str(c).strip() for c in table.columns}
-    ticker_col = colmap.get("ticker", colmap.get("symbol"))
-    name_col = colmap.get("name", colmap.get("company"))
-
-    # Optional columns that help mapping
-    exchange_col = None
-    country_col = None
-    sector_col = None
-
-    for key in ["exchange", "listing", "market"]:
-        if key in colmap:
-            exchange_col = colmap[key]
-            break
-    for key in ["country", "country (of incorporation)", "headquarters"]:
-        if key in colmap:
-            country_col = colmap[key]
-            break
-    for key in ["sector", "industry"]:
-        if key in colmap:
-            sector_col = colmap[key]
-            break
-
-    if ticker_col is None or name_col is None:
-        raise RuntimeError("EURO STOXX 50 scrape failed: missing ticker/name columns after normalization")
-
-    # Yahoo suffix mapping
-    exchange_suffix = {
-        # Germany
-        "xetra": ".DE",
-        "frankfurt": ".DE",
-        "deutsche börse": ".DE",
-        # France
-        "euronext paris": ".PA",
-        "paris": ".PA",
-        # Netherlands
-        "euronext amsterdam": ".AS",
-        "amsterdam": ".AS",
-        # Italy
-        "borsa italiana": ".MI",
-        "milan": ".MI",
-        "milano": ".MI",
-        # Spain
-        "madrid": ".MC",
-        "bolsas y mercados españoles": ".MC",
-        "bme": ".MC",
-        # Belgium
-        "euronext brussels": ".BR",
-        "brussels": ".BR",
-        # Finland
-        "helsinki": ".HE",
-        "nasdaq helsinki": ".HE",
-        # Ireland
-        "irish stock exchange": ".IR",
-        "dublin": ".IR",
-        # Portugal
-        "euronext lisbon": ".LS",
-        "lisbon": ".LS",
-        # Austria
-        "vienna": ".VI",
-        # Switzerland
-        "swiss exchange": ".SW",
-        "six swiss exchange": ".SW",
-    }
-
-    country_suffix = {
-        "germany": ".DE",
-        "france": ".PA",
-        "netherlands": ".AS",
-        "italy": ".MI",
-        "spain": ".MC",
-        "belgium": ".BR",
-        "finland": ".HE",
-        "ireland": ".IR",
-        "portugal": ".LS",
-        "austria": ".VI",
-        "switzerland": ".SW",
-    }
-
-    # Small set of known special cases (kept, but should be rarely needed now)
-    yahoo_overrides = {
-        # sometimes Wikipedia has legacy/odd formats
-        "NOKIA": "NOKIA.HE",
-    }
-
-    def _to_yahoo_symbol(raw_ticker: str, exchange: str | None, country: str | None) -> str:
-        t = (raw_ticker or "").strip()
-        if not t:
-            return ""
-
-        # Overrides first
-        if t in yahoo_overrides:
-            return yahoo_overrides[t]
-
-        # Already a Yahoo symbol with suffix
-        if "." in t:
-            return t
-
-        exch = (exchange or "").strip().lower()
-        ctry = (country or "").strip().lower()
-
-        # Best: exchange-based mapping
-        for k, suf in exchange_suffix.items():
-            if k in exch:
-                return f"{t}{suf}"
-
-        # Fallback: country-based mapping
-        for k, suf in country_suffix.items():
-            if k in ctry:
-                return f"{t}{suf}"
-
-        # Last resort: return as-is (may still work for a few names, but most won't)
-        return t
-
-    tickers_raw = table[ticker_col].astype(str).str.strip()
-    exchanges = table[exchange_col].astype(str).str.strip() if exchange_col else pd.Series([None] * len(table))
-    countries = table[country_col].astype(str).str.strip() if country_col else pd.Series([None] * len(table))
-
-    yahoo_tickers = [
-        _to_yahoo_symbol(t, e if exchange_col else None, c if country_col else None)
-        for t, e, c in zip(tickers_raw.tolist(), exchanges.tolist(), countries.tolist())
-    ]
+    tickers = table[ticker_col].astype(str).str.strip()
+    names = table[name_col].astype(str).str.strip()
 
     out = pd.DataFrame(
         {
-            "Ticker": yahoo_tickers,
-            "Name": table[name_col].astype(str).str.strip(),
+            "Ticker": tickers,
+            "Name": names,
             "Sector": table[sector_col].astype(str).str.strip() if sector_col else None,
         }
     )
 
+    # basic cleaning
     out = out.dropna(subset=["Ticker"])
     out["Ticker"] = out["Ticker"].astype(str).str.strip()
-    out = out[out["Ticker"] != ""].drop_duplicates(subset=["Ticker"]).reset_index(drop=True)
+    out = out[out["Ticker"] != ""].reset_index(drop=True)
 
+    # guard: should mostly be exchange-suffixed tickers
+    # (Wikipedia currently lists like ADS.DE, SAN.PA, etc.)
     return out[["Ticker", "Name", "Sector"]]
 
 
 # ==========================================================
-# 2. YAHOO DOWNLOADER (600 days, batched)
+# 2. YAHOO DOWNLOADER (batched)
 # ==========================================================
+def _extract_one_ticker_frame(data: pd.DataFrame, ticker: str) -> pd.DataFrame | None:
+    """
+    yfinance returns a few different shapes depending on tickers/interval.
+    This extracts OHLC for a single ticker robustly.
+    """
+    if data is None or data.empty:
+        return None
+
+    # Case A: group_by="ticker" => columns MultiIndex: (ticker, field)
+    if isinstance(data.columns, pd.MultiIndex):
+        lvl0 = set(map(str, data.columns.get_level_values(0)))
+        lvl1 = set(map(str, data.columns.get_level_values(1)))
+
+        if ticker in lvl0:
+            df_t = data[ticker].copy()
+        elif ticker in lvl1:
+            # sometimes columns are (field, ticker)
+            df_t = data.xs(ticker, axis=1, level=1, drop_level=True).copy()
+        else:
+            return None
+    else:
+        # Single ticker request sometimes returns flat columns already
+        # but in our batching we still might see flat if only 1 valid ticker returned.
+        cols = [c.lower() for c in data.columns]
+        needed = {"open", "high", "low", "close"}
+        if needed.issubset(set(cols)):
+            df_t = data.copy()
+            # normalize column names
+            rename_map = {c: c.title() for c in data.columns}
+            df_t = df_t.rename(columns=rename_map)
+        else:
+            return None
+
+    # Normalize expected OHLC column capitalization
+    col_map = {}
+    for c in df_t.columns:
+        cl = str(c).lower()
+        if cl == "open":
+            col_map[c] = "Open"
+        elif cl == "high":
+            col_map[c] = "High"
+        elif cl == "low":
+            col_map[c] = "Low"
+        elif cl == "close":
+            col_map[c] = "Close"
+        elif cl == "adj close":
+            col_map[c] = "Adj Close"
+        elif cl == "volume":
+            col_map[c] = "Volume"
+    df_t = df_t.rename(columns=col_map)
+
+    if not {"Open", "High", "Low", "Close"}.issubset(df_t.columns):
+        return None
+
+    df_t = df_t.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+    if df_t.empty:
+        return None
+
+    return df_t
+
 
 def download_yahoo_prices(tickers, label, period="600d", interval="1d"):
     """
@@ -266,11 +263,7 @@ def download_yahoo_prices(tickers, label, period="600d", interval="1d"):
     Uses yf.download in batches of 40 tickers (no manual threads).
     Returns a list of clean DataFrames.
     """
-    if not tickers:
-        return []
-
-    # clean list
-    tickers = [str(t).strip() for t in tickers if str(t).strip()]
+    tickers = [str(t).strip() for t in (tickers or []) if str(t).strip()]
     if not tickers:
         return []
 
@@ -278,11 +271,11 @@ def download_yahoo_prices(tickers, label, period="600d", interval="1d"):
     frames = []
 
     for i in range(0, len(tickers), batch_size):
-        batch = tickers[i:i + batch_size]
+        batch = tickers[i : i + batch_size]
 
         try:
             data = yf.download(
-                batch,
+                tickers=batch,
                 period=period,
                 interval=interval,
                 group_by="ticker",
@@ -293,31 +286,15 @@ def download_yahoo_prices(tickers, label, period="600d", interval="1d"):
         except Exception:
             continue
 
-        if data is None or getattr(data, "empty", True):
-            continue
-
-        is_multi = isinstance(data.columns, pd.MultiIndex)
-
         for t in batch:
             try:
-                if is_multi:
-                    if t not in data.columns.get_level_values(0):
-                        continue
-                    df_t = data[t].dropna().copy()
-                else:
-                    # yfinance returns non-multiindex for single ticker batches
-                    if len(batch) != 1:
-                        # unexpected shape; skip safely
-                        continue
-                    df_t = data.dropna().copy()
-
-                if df_t.empty:
+                df_t = _extract_one_ticker_frame(data, t)
+                if df_t is None or df_t.empty:
                     continue
-
+                df_t = df_t.copy()
                 df_t["Ticker"] = t
                 df_t["Index"] = label
                 frames.append(df_t.reset_index())
-
             except Exception:
                 continue
 
@@ -327,7 +304,6 @@ def download_yahoo_prices(tickers, label, period="600d", interval="1d"):
 # ==========================================================
 # 3. MASTER FUNCTIONS (engine/app call these)
 # ==========================================================
-
 def load_all_market_data():
     """
     Returns a merged OHLC dataframe for SP500 + HSI + EURO STOXX 50
@@ -341,38 +317,20 @@ def load_all_market_data():
     hs = download_yahoo_prices(hsi["Ticker"].tolist(), "HSI", period="600d", interval="1d")
     euro = download_yahoo_prices(eurostoxx50["Ticker"].tolist(), "EUROSTOXX50", period="600d", interval="1d")
 
-    # Hard fail if EURO didn't load (otherwise you'll "think" it's working)
-    if not euro:
-        raise RuntimeError("EUROSTOXX50 download returned 0 tickers. Yahoo symbol mapping likely wrong / Wikipedia table changed.")
-
     if not (sp or hs or euro):
         raise RuntimeError("No OHLC data downloaded from Yahoo")
 
     combined = pd.concat(sp + hs + euro, ignore_index=True)
 
-    # Standardize date column name from reset_index()
-    if "Date" not in combined.columns:
-        # sometimes yfinance uses 'index' name variations, but reset_index() should create one
-        # try to detect the first datetime-like column
-        dt_candidates = [c for c in combined.columns if str(c).lower() in ("date", "datetime")]
-        if dt_candidates:
-            combined = combined.rename(columns={dt_candidates[0]: "Date"})
-        else:
-            raise RuntimeError("Daily data missing Date column after download")
+    # yfinance uses either "Date" or "Datetime" index name depending on interval
+    date_col = "Date" if "Date" in combined.columns else ("Datetime" if "Datetime" in combined.columns else None)
+    if date_col is None:
+        raise RuntimeError("Downloaded data missing Date/Datetime column")
 
+    combined = combined.rename(columns={date_col: "Date"})
     combined["Date"] = pd.to_datetime(combined["Date"], errors="coerce")
-    combined = combined.dropna(subset=["Date"]).sort_values(["Ticker", "Date"]).reset_index(drop=True)
-
-    # Safety checks
-    if any(str(t).endswith(".SI") for t in combined["Ticker"].unique()):
-        raise RuntimeError("Found .SI tickers; STI still present")
-
-    europe_suffixes = (".DE", ".PA", ".AS", ".MI", ".MC", ".BR", ".HE", ".IR", ".LS", ".VI", ".SW")
-    if sum(str(t).endswith(europe_suffixes) for t in combined["Ticker"].unique()) < 10:
-        raise RuntimeError("EURO STOXX tickers not present or Yahoo mapping failed")
-
-    if "Index" not in combined.columns or not combined["Index"].isin(["SP500", "HSI", "EUROSTOXX50"]).any():
-        raise RuntimeError("Index labels missing or EUROSTOXX50 not included")
+    combined = combined.dropna(subset=["Date"])
+    combined = combined.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
     return combined
 
@@ -390,9 +348,6 @@ def load_all_market_data_hourly():
     hs = download_yahoo_prices(hsi["Ticker"].tolist(), "HSI", period="60d", interval="60m")
     euro = download_yahoo_prices(eurostoxx50["Ticker"].tolist(), "EUROSTOXX50", period="60d", interval="60m")
 
-    if not euro:
-        raise RuntimeError("EUROSTOXX50 hourly download returned 0 tickers. Yahoo symbol mapping likely wrong / Wikipedia table changed.")
-
     if not (sp or hs or euro):
         raise RuntimeError("No hourly OHLC data downloaded from Yahoo")
 
@@ -404,21 +359,12 @@ def load_all_market_data_hourly():
 
     combined = combined.rename(columns={datetime_col: "DateTime"})
     combined["DateTime"] = pd.to_datetime(combined["DateTime"], errors="coerce")
-    combined = combined.dropna(subset=["DateTime"]).sort_values(["Ticker", "DateTime"]).reset_index(drop=True)
+    combined = combined.dropna(subset=["DateTime"])
+    combined = combined.sort_values(["Ticker", "DateTime"]).reset_index(drop=True)
 
     required = {"Ticker", "DateTime", "Open", "High", "Low", "Close"}
     missing = required.difference(combined.columns)
     if missing:
         raise RuntimeError(f"Hourly data missing required columns: {sorted(missing)}")
-
-    if any(str(t).endswith(".SI") for t in combined["Ticker"].unique()):
-        raise RuntimeError("Found .SI tickers; STI still present")
-
-    europe_suffixes = (".DE", ".PA", ".AS", ".MI", ".MC", ".BR", ".HE", ".IR", ".LS", ".VI", ".SW")
-    if sum(str(t).endswith(europe_suffixes) for t in combined["Ticker"].unique()) < 10:
-        raise RuntimeError("EURO STOXX tickers not present or Yahoo mapping failed")
-
-    if "Index" not in combined.columns or not combined["Index"].isin(["SP500", "HSI", "EUROSTOXX50"]).any():
-        raise RuntimeError("Index labels missing or EUROSTOXX50 not included")
 
     return combined
