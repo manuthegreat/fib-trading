@@ -107,6 +107,18 @@ ENGINE_VERSION = "2026-02-21-listb-debug-v2"
 @st.cache_data(show_spinner=True)
 def compute_dashboard(engine_version):
     _ = engine_version
+    (
+        df_all,
+        combined,
+        insight_df,
+        hourly_entries_df,
+        hourly_rejects_df,
+        hourly_df,
+    ) = run_engine()
+    return df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df, hourly_df
+
+
+df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df, hourly_df = compute_dashboard(ENGINE_VERSION)
     df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df, hourly_df = run_engine()
     return df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df, hourly_df
 

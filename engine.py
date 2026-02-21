@@ -613,6 +613,22 @@ def build_hourly_entries(
             continue
 
 
+        impulse_indices = after_low.index[impulse_mask.fillna(False)]
+        if len(impulse_indices) == 0:
+            rejects.append({"Ticker": ticker, "RejectReason": "no_impulse_bar"})
+            continue
+
+        impulse_idx = impulse_indices[-1]
+        impulse_pos = after_low.index.get_loc(impulse_idx)
+        window_start = max(0, impulse_pos - 1)
+        window_end = min(len(after_low), impulse_pos + 2)
+        local_window = after_low.iloc[window_start:window_end]
+
+        if local_window.empty:
+            rejects.append({"Ticker": ticker, "RejectReason": "invalid_impulse_window"})
+            continue
+
+
         if local_window.empty:
             rejects.append({"Ticker": ticker, "RejectReason": "invalid_impulse_window"})
             continue
