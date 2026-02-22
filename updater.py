@@ -1,9 +1,9 @@
 """
 updater.py
-Yahoo-only downloader
-SP500 + HSI unchanged
-EU uses fast batched Yahoo approach (365d)
-No stooq
+Stable version
+SP500 + HSI only
+EU completely removed
+Yahoo-only
 """
 
 from __future__ import annotations
@@ -23,37 +23,50 @@ import yfinance as yf
 def get_sp500_universe() -> pd.DataFrame:
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     headers = {"User-Agent": "Mozilla/5.0"}
+
     r = requests.get(url, headers=headers, timeout=20)
     r.raise_for_status()
 
     tables = pd.read_html(StringIO(r.text))
     df = None
+
     for t in tables:
         if "Symbol" in t.columns:
             df = t.copy()
             break
+
     if df is None:
         raise RuntimeError("Could not find S&P500 table")
 
-    df["Ticker"] = df["Symbol"].astype(str).str.replace(".", "-", regex=False).str.strip()
+    df["Ticker"] = (
+        df["Symbol"]
+        .astype(str)
+        .str.replace(".", "-", regex=False)
+        .str.strip()
+    )
+
     df["Name"] = df["Security"].astype(str).str.strip()
     df["Sector"] = df["GICS Sector"].astype(str).str.strip()
+
     return df[["Ticker", "Name", "Sector"]]
 
 
 def get_hsi_universe() -> pd.DataFrame:
     url = "https://en.wikipedia.org/wiki/Hang_Seng_Index"
     headers = {"User-Agent": "Mozilla/5.0"}
+
     r = requests.get(url, headers=headers, timeout=20)
     r.raise_for_status()
 
     tables = pd.read_html(StringIO(r.text))
     df = None
+
     for t in tables:
         cols = [str(c).lower() for c in t.columns]
         if any(x in cols for x in ["ticker", "code"]):
             df = t.copy()
             break
+
     if df is None:
         raise RuntimeError("Could not find HSI table")
 
@@ -64,6 +77,7 @@ def get_hsi_universe() -> pd.DataFrame:
         if "code" in c or "ticker" in c:
             ticker_col = c
             break
+
     if ticker_col is None:
         raise RuntimeError("HSI ticker column not found")
 
@@ -77,36 +91,15 @@ def get_hsi_universe() -> pd.DataFrame:
     )
 
     name_col = df.columns[0]
+
     df["Name"] = df[name_col].astype(str).str.strip()
     df["Sector"] = ""
 
     return df[["Ticker", "Name", "Sector"]]
 
 
-def get_eurostoxx50_universe() -> pd.DataFrame:
-    """
-    Static list for stability.
-    """
-    tickers = [
-        "ASML.AS","ADYEN.AS","AIR.PA","ALV.DE","ABI.BR","BBVA.MC","BAS.DE",
-        "BAYN.DE","BMW.DE","BNP.PA","CRG.IR","CS.PA","DAI.DE","DG.PA",
-        "DPW.DE","ENEL.MI","ENGI.PA","ENI.MI","IBE.MC","IFX.DE",
-        "ITX.MC","KER.PA","LIN.DE","MC.PA","MUV2.DE","NOKIA.HE",
-        "OR.PA","PHIA.AS","RI.PA","RMS.PA","SAN.PA","SAN.MC",
-        "SAP.DE","SIE.DE","SU.PA","TTE.PA","VOW3.DE","VNA.DE",
-        "BN.PA","ISP.MI","GLE.PA","AI.PA","PRX.AS","UCG.MI",
-        "DTE.DE","ADS.DE","HEIA.AS","AMS.MC","STLAM.MI"
-    ]
-
-    return pd.DataFrame({
-        "Ticker": tickers,
-        "Name": tickers,
-        "Sector": ""
-    })
-
-
 # ==========================================================
-# 2) DOWNLOADERS
+# 2) YAHOO DOWNLOADER
 # ==========================================================
 
 def download_batch(
@@ -146,12 +139,14 @@ def download_batch(
                         df_t = data
 
                     df_t = df_t.dropna(subset=["Open", "High", "Low", "Close"])
+
                     if df_t.empty:
                         continue
 
                     df_t = df_t.copy()
                     df_t["Ticker"] = t
                     df_t["Index"] = label
+
                     frames.append(df_t.reset_index())
 
                 except Exception:
@@ -169,7 +164,7 @@ def download_batch(
 
 def load_all_market_data() -> pd.DataFrame:
 
-    # ---- SP500 (UNCHANGED) ----
+    # ---- SP500 ----
     sp500 = get_sp500_universe()
     sp_frames = download_batch(
         sp500["Ticker"].tolist(),
@@ -179,7 +174,7 @@ def load_all_market_data() -> pd.DataFrame:
         batch_size=25,
     )
 
-    # ---- HSI (UNCHANGED) ----
+    # ---- HSI ----
     hsi = get_hsi_universe()
     hsi_frames = download_batch(
         hsi["Ticker"].tolist(),
@@ -189,23 +184,12 @@ def load_all_market_data() -> pd.DataFrame:
         batch_size=20,
     )
 
-    # ---- EU (MODIFIED AS REQUESTED) ----
-    euro = get_eurostoxx50_universe()
-    eu_frames = download_batch(
-        euro["Ticker"].tolist(),
-        label="EUROSTOXX50",
-        period="365d",        # <-- changed to 365
-        interval="1d",
-        batch_size=10,        # smaller batch for EU stability
-    )
-
-    all_frames = sp_frames + hsi_frames + eu_frames
+    all_frames = sp_frames + hsi_frames
 
     if not all_frames:
         raise RuntimeError("No data downloaded from Yahoo")
 
     final_df = pd.concat(all_frames, ignore_index=True)
-
     final_df = final_df.sort_values(["Ticker", "Date"])
     final_df.reset_index(drop=True, inplace=True)
 
@@ -220,5 +204,4 @@ def compute_dashboard():
     """
     Entry point used by Streamlit app.
     """
-    df = load_all_market_data()
-    return df
+    return load_all_market_data()
