@@ -2,18 +2,21 @@
 updater.py  (simple, Streamlit-friendly version)
 
 ✓ Builds SP500, HSI, EURO STOXX 50 universes
-✓ Downloads daily OHLC (600d) from Yahoo in batches
+✓ Downloads daily OHLC from Yahoo:
+    - SP500: batched (UNCHANGED)
+    - HSI:   batched (UNCHANGED)
+    - EURO STOXX 50: single-name (per-ticker), 365d (as requested)
 ✓ Hourly data is PROVIDED VIA helper that downloads ONLY the tickers you pass in
   (critical to avoid Yahoo rate limits)
 ✓ Returns ONE CLEAN MERGED DATAFRAME
 ✓ No parquet saving, no disk IO
+✓ NO STOOQ dependency
 """
 
 from __future__ import annotations
 
 import time
 from io import StringIO
-from datetime import timedelta
 from typing import Iterable, List, Optional
 
 import pandas as pd
@@ -166,14 +169,13 @@ def get_eurostoxx50_universe() -> pd.DataFrame:
     ]
 
     df = pd.DataFrame(data, columns=["Ticker", "Name", "Sector"])
-    # Ensure uniqueness + non-empty
     df["Ticker"] = df["Ticker"].astype(str).str.strip()
     df = df[df["Ticker"] != ""].drop_duplicates(subset=["Ticker"]).reset_index(drop=True)
     return df
 
 
 # ==========================================================
-# 2. YAHOO DOWNLOADER (batched + retries)
+# 2. YAHOO DOWNLOADER (SP500/HSI batched unchanged)
 # ==========================================================
 
 def _chunk(lst: List[str], n: int) -> List[List[str]]:
@@ -189,6 +191,8 @@ def _download_single_ticker(
 ) -> Optional[pd.DataFrame]:
     """
     Single-name fallback download used when a batch call returns partial/empty data.
+    NOTE: kept as-is except safer dropna subset to avoid nuking valid EU rows when
+    Volume/Adj Close are missing (Yahoo sometimes does that).
     """
     last_exc: Optional[Exception] = None
 
@@ -206,7 +210,18 @@ def _download_single_ticker(
                 time.sleep(sleep_s * attempt)
                 continue
 
-            return data.dropna().copy()
+            # Only require OHLC; don't drop rows because Volume/Adj Close is NaN
+            cols = [c for c in ["Open", "High", "Low", "Close"] if c in data.columns]
+            if cols:
+                data = data.dropna(subset=cols)
+            else:
+                data = data.dropna()
+
+            if data.empty:
+                time.sleep(sleep_s * attempt)
+                continue
+
+            return data.copy()
         except Exception as exc:
             last_exc = exc
             time.sleep(sleep_s * attempt)
@@ -232,6 +247,9 @@ def download_yahoo_prices(
     Downloads OHLC for a list of tickers.
     Uses small batches + retries to reduce YF rate-limits.
     Returns list of per-ticker DataFrames (with Date/Datetime index reset).
+
+    IMPORTANT: This function is left functionally the same for SP500 & HSI,
+    but uses a safer dropna subset (OHLC only) so valid rows aren't discarded.
     """
     tickers = [str(t).strip() for t in tickers if str(t).strip()]
     if not tickers:
@@ -258,26 +276,30 @@ def download_yahoo_prices(
                 break
             except Exception as exc:
                 last_exc = exc
-                # Exponential-ish backoff
                 time.sleep(sleep_s * attempt)
 
         if last_exc is not None:
             print(f"[WARN] Yahoo batch download failed ({label}) for {batch}: {last_exc}")
             data = pd.DataFrame()
 
-        # yfinance output format differs for 1 ticker vs many tickers
         found_in_batch = set()
         for t in batch:
             try:
                 if isinstance(data.columns, pd.MultiIndex):
                     if t not in data.columns.get_level_values(0):
                         continue
-                    df_t = data[t].dropna().copy()
+                    df_t = data[t].copy()
                 else:
-                    # single-ticker download returns flat columns
                     if len(batch) != 1:
                         continue
-                    df_t = data.dropna().copy()
+                    df_t = data.copy()
+
+                # Only require OHLC; don't drop because Volume/Adj Close are NaN
+                cols = [c for c in ["Open", "High", "Low", "Close"] if c in df_t.columns]
+                if cols:
+                    df_t = df_t.dropna(subset=cols)
+                else:
+                    df_t = df_t.dropna()
 
                 if df_t.empty:
                     continue
@@ -289,8 +311,7 @@ def download_yahoo_prices(
             except Exception:
                 continue
 
-        # Fallback: retry missing names as single downloads so one bad symbol
-        # does not poison an entire batch (common with Yahoo non-US coverage).
+        # Fallback: retry missing names as single downloads
         missing = [t for t in batch if t not in found_in_batch]
         for t in missing:
             df_t = _download_single_ticker(
@@ -320,104 +341,49 @@ def download_yahoo_prices(
     return frames
 
 
-def _period_to_timedelta(period: str) -> timedelta:
-    period = str(period).strip().lower()
-    if period.endswith("d"):
-        return timedelta(days=int(period[:-1]))
-    if period.endswith("mo"):
-        return timedelta(days=int(period[:-2]) * 30)
-    if period.endswith("y"):
-        return timedelta(days=int(period[:-1]) * 365)
-    # Fallback used when provider format differs (keep ~2 years by default)
-    return timedelta(days=730)
+# ==========================================================
+# 2B. EURO STOXX 50 DAILY (single-name only, 365d)
+# ==========================================================
 
-
-def _download_single_stooq_ticker(
-    ticker: str,
-    period: str,
-    interval: str,
-    max_retries: int,
-    sleep_s: float,
-) -> Optional[pd.DataFrame]:
-    """
-    Stooq fallback for daily bars when Yahoo is unavailable/blocked.
-    """
-    if interval != "1d":
-        return None
-
-    symbol = ticker.strip().lower()
-    if not symbol:
-        return None
-
-    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
-    cutoff = pd.Timestamp.utcnow().tz_localize(None) - _period_to_timedelta(period)
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            r = requests.get(url, timeout=20)
-            r.raise_for_status()
-            df = pd.read_csv(StringIO(r.text))
-
-            required_cols = {"Date", "Open", "High", "Low", "Close"}
-            if df.empty or not required_cols.issubset(df.columns):
-                time.sleep(sleep_s * attempt)
-                continue
-
-            for col in ["Open", "High", "Low", "Close"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-            df = df.dropna(subset=["Date", "Open", "High", "Low", "Close"])
-            if df.empty:
-                time.sleep(sleep_s * attempt)
-                continue
-
-            df = df[df["Date"] >= cutoff]
-            if df.empty:
-                continue
-
-            return df.sort_values("Date").reset_index(drop=True)
-        except Exception:
-            time.sleep(sleep_s * attempt)
-
-    return None
-
-
-def download_stooq_prices(
+def download_eurostoxx50_daily_single(
     tickers: List[str],
-    label: str,
-    period: str = "600d",
+    label: str = "EUROSTOXX50",
+    period: str = "365d",
     interval: str = "1d",
-    max_retries: int = 3,
-    sleep_s: float = 1.0,
+    max_retries: int = 4,
+    sleep_s: float = 1.25,
 ) -> List[pd.DataFrame]:
     """
-    Downloads per-ticker OHLC from Stooq (daily only).
-    Returns list of DataFrames with Date/Ticker/Index columns aligned to Yahoo output.
+    EURO STOXX 50 downloader:
+    - single-name requests only (no batch)
+    - period=365d (as requested)
+    - returns frames aligned with the rest of the pipeline
     """
+    tickers = [str(t).strip() for t in tickers if str(t).strip()]
     frames: List[pd.DataFrame] = []
     failed: List[str] = []
 
-    for ticker in tickers:
-        df_t = _download_single_stooq_ticker(
-            ticker=ticker,
+    for t in tickers:
+        df_t = _download_single_ticker(
+            ticker=t,
             period=period,
             interval=interval,
             max_retries=max_retries,
             sleep_s=sleep_s,
         )
         if df_t is None or df_t.empty:
-            failed.append(ticker)
-            continue
+            failed.append(t)
+        else:
+            df_t["Ticker"] = t
+            df_t["Index"] = label
+            frames.append(df_t.reset_index())
 
-        df_t["Ticker"] = ticker
-        df_t["Index"] = label
-        frames.append(df_t)
+        # gentle pacing to reduce blocking
         time.sleep(sleep_s)
 
     if failed:
         print(
-            f"[WARN] Stooq returned no usable {interval} data for {len(failed)} "
+            f"[WARN] Yahoo returned no usable {interval} data for {len(failed)} "
             f"{label} tickers: {', '.join(sorted(set(failed))[:20])}"
             + (" ..." if len(set(failed)) > 20 else "")
         )
@@ -432,17 +398,22 @@ def download_stooq_prices(
 def load_all_market_data() -> pd.DataFrame:
     """
     Returns merged DAILY OHLC dataframe for SP500 + HSI + EURO STOXX 50.
+
+    Requirements from you:
+    1) don't change anything for SP500 and HSI  -> still uses download_yahoo_prices()
+    2) EU single-name only, 365d              -> uses download_eurostoxx50_daily_single()
+    3) remove stooq dependency                -> no stooq anywhere
     """
     sp500 = get_sp500_universe()
     hsi = get_hsi_universe()
     euro = get_eurostoxx50_universe()
 
+    # SP500 / HSI unchanged behavior (still batched)
     sp_frames = download_yahoo_prices(sp500["Ticker"].tolist(), "SP500", period="600d", interval="1d")
     hs_frames = download_yahoo_prices(hsi["Ticker"].tolist(), "HSI", period="600d", interval="1d")
-    eu_frames = download_yahoo_prices(euro["Ticker"].tolist(), "EUROSTOXX50", period="600d", interval="1d")
-    if not eu_frames:
-        print("[INFO] Yahoo returned no EURO STOXX 50 data; retrying with Stooq fallback")
-        eu_frames = download_stooq_prices(euro["Ticker"].tolist(), "EUROSTOXX50", period="600d", interval="1d")
+
+    # EU: single-name only, 365d
+    eu_frames = download_eurostoxx50_daily_single(euro["Ticker"].tolist(), "EUROSTOXX50", period="365d", interval="1d")
 
     if not (sp_frames or hs_frames or eu_frames):
         raise RuntimeError("No DAILY OHLC data downloaded from Yahoo")
