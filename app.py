@@ -159,25 +159,43 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
         }
     )
 
-    st.dataframe(
+    hourly_event = st.dataframe(
         hourly_view,
         hide_index=True,
         use_container_width=True,
         key="hourly_ranked_df",
+        on_select="rerun",
+        selection_mode="single-row",
     )
 
-    if not ranked_hourly.empty:
-        inspect_idx = st.number_input(
-            "Inspect hourly row index",
-            min_value=0,
-            max_value=max(len(ranked_hourly.head(top_n)) - 1, 0),
-            value=0,
-            step=1,
-        )
-        selected_row = ranked_hourly.head(top_n).iloc[int(inspect_idx)] if len(ranked_hourly.head(top_n)) else None
-        hourly_ticker_selected = selected_row.get("Ticker") if selected_row is not None else None
-    else:
-        hourly_ticker_selected = None
+    hourly_selected_rows = []
+    if hourly_event is not None:
+        if hasattr(hourly_event, "selection") and hasattr(hourly_event.selection, "rows"):
+            hourly_selected_rows = hourly_event.selection.rows
+        elif hasattr(hourly_event, "rows"):
+            hourly_selected_rows = hourly_event.rows
+        elif isinstance(hourly_event, dict):
+            if "selection" in hourly_event and isinstance(hourly_event["selection"], dict):
+                hourly_selected_rows = hourly_event["selection"].get("rows", [])
+            else:
+                hourly_selected_rows = hourly_event.get("rows", [])
+
+    if "hourly_selected_ticker" not in st.session_state:
+        st.session_state.hourly_selected_ticker = None
+
+    hourly_top = ranked_hourly.head(top_n).reset_index(drop=True)
+    if hourly_selected_rows:
+        selected_idx = hourly_selected_rows[0]
+        if 0 <= selected_idx < len(hourly_top):
+            st.session_state.hourly_selected_ticker = hourly_top.iloc[selected_idx]["Ticker"]
+
+    if (
+        st.session_state.hourly_selected_ticker is None
+        and not hourly_top.empty
+    ):
+        st.session_state.hourly_selected_ticker = hourly_top.iloc[0]["Ticker"]
+
+    hourly_ticker_selected = st.session_state.hourly_selected_ticker
 
     if hourly_ticker_selected and hourly_df is not None and not hourly_df.empty:
         selected_hourly_row = ranked_hourly[ranked_hourly["Ticker"] == hourly_ticker_selected]
