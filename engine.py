@@ -54,11 +54,8 @@ def find_swing_as_of_quick(group, current_date, lookback_days=LOOKBACK_DAYS):
     swing_high_date = pd.to_datetime(dates[best_rel_idx])
 
     # Find swing low BEFORE that pivot based on LOW
-    pre_high_segment = group[group["Date"] <= swing_high_date]
-    if pre_high_segment.empty:
-        return None
-    
-    low_idx = pre_high_segment["Low"].idxmin()
+    prior_segment = window.iloc[: best_rel_idx + 1]
+    low_idx = prior_segment["Low"].idxmin()
     
     swing_low_price = float(group.loc[low_idx, "Low"])
     swing_low_date = pd.to_datetime(group.loc[low_idx, "Date"])
