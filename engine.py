@@ -12,6 +12,7 @@ pd.set_option("display.max_columns", None)
 
 # --- Parameters ---
 LOOKBACK_DAYS = 300
+PRE_HIGH_LOOKBACK = 365
 BOUNCE_TOL = 0.01
 
 
@@ -54,11 +55,18 @@ def find_swing_as_of_quick(group, current_date, lookback_days=LOOKBACK_DAYS):
     swing_high_date = pd.to_datetime(dates[best_rel_idx])
 
     # Find swing low BEFORE that pivot based on LOW
-    prior_segment = window.iloc[: best_rel_idx + 1]
-    low_idx = prior_segment["Low"].idxmin()
+    pre_high_start = swing_high_date - pd.Timedelta(days=PRE_HIGH_LOOKBACK)
+    pre_high = group[
+        (group["Date"] <= swing_high_date) &
+        (group["Date"] >= pre_high_start)
+    ]
     
+    if pre_high.empty:
+        return None
+    
+    low_idx = pre_high["Low"].idxmin()
     swing_low_price = float(group.loc[low_idx, "Low"])
-    swing_low_date = pd.to_datetime(group.loc[low_idx, "Date"])
+    swing_low_date  = pd.to_datetime(group.loc[low_idx, "Date"])
     if swing_low_price >= swing_high_price:
         return None
 
