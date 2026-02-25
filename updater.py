@@ -1,13 +1,13 @@
 """ updater.py — Yahoo-only, SP500 + HSI + Euro Stoxx 50
 
 Optimised for Streamlit Cloud:
-  - NO threading (Streamlit Cloud CPU throttling makes threads slower,
-    and concurrent downloads exceed the 1 GB RAM limit causing silent
-    worker kills that show up as missing tickers)
+  - NO threading (exceeds 1 GB RAM limit on Streamlit Cloud)
   - Large batches (50 tickers/call) → only 11 round trips for SP500
   - Sequential universes → peak RAM = 1 universe at a time
-  - Minimal sleep (Streamlit Cloud datacenter IPs rarely get throttled)
-  - Exponential backoff on failures
+  - Handles BOTH yfinance MultiIndex formats:
+      old (pre-0.2): columns = (ticker, field)
+      new (0.2.x+):  columns = (field, ticker)
+    This was the root cause of EU tickers silently disappearing.
 
 Expected runtime on Streamlit Cloud: ~60-90 seconds total.
 """
@@ -28,10 +28,12 @@ import yfinance as yf
 # SETTINGS
 # ==========================================================
 BATCH_SIZE          = 50    # tickers per yf.download() call
-INTER_BATCH_SLEEP_S = 0.3   # small sleep between batches (datacenter IPs
-                             # rarely get rate-limited by Yahoo)
+INTER_BATCH_SLEEP_S = 0.3   # small sleep between batches
 BASE_SLEEP_S        = 1.5   # base for exponential backoff
 MAX_RETRIES         = 3     # retries per batch / single ticker
+
+# OHLC field names — used to detect MultiIndex orientation
+_OHLC_FIELDS = {"Open", "High", "Low", "Close", "Volume", "Adj Close"}
 
 
 # ==========================================================
@@ -218,6 +220,39 @@ def _clean_ohlc(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _extract_ticker_df(data: pd.DataFrame, ticker: str, batch_len: int) -> pd.DataFrame:
+    """
+    Safely extract a single ticker's OHLC from a yf.download() result.
+
+    Handles both yfinance MultiIndex formats:
+      - Old (pre-0.2.x): columns = (ticker, field)  → level 0 has tickers
+      - New (0.2.x+):    columns = (field,  ticker)  → level 1 has tickers
+
+    This mismatch was the root cause of EU tickers silently disappearing:
+    the old code assumed level 0 always contained tickers, but new yfinance
+    puts field names (Open/High/Low/Close) in level 0 and tickers in level 1.
+    """
+    if not isinstance(data.columns, pd.MultiIndex):
+        # Flat columns → single-ticker download
+        if batch_len != 1:
+            return pd.DataFrame()
+        return _clean_ohlc(data)
+
+    lvl0 = set(data.columns.get_level_values(0).tolist())
+    lvl1 = set(data.columns.get_level_values(1).tolist())
+
+    if ticker in lvl1:
+        # New yfinance format: (field, ticker) — ticker is in level 1
+        df_t = data.xs(ticker, axis=1, level=1)
+    elif ticker in lvl0:
+        # Old yfinance format: (ticker, field) — ticker is in level 0
+        df_t = data[ticker]
+    else:
+        return pd.DataFrame()
+
+    return _clean_ohlc(df_t)
+
+
 def _backoff_sleep(attempt: int) -> None:
     """Exponential backoff with jitter: 1.5s, 3s, 6s ..."""
     time.sleep(BASE_SLEEP_S * (2 ** (attempt - 1)) + random.uniform(0.1, 0.5))
@@ -308,29 +343,18 @@ def download_yahoo_prices(
         if last_exc is not None:
             print(f"[WARN] {label} batch {batch_num} failed all retries")
 
-        # --- Extract per-ticker frames from batch result ---
+        # --- Extract per-ticker frames ---
         found: set = set()
 
         for t in batch:
             try:
-                if isinstance(data.columns, pd.MultiIndex):
-                    if t not in data.columns.get_level_values(0):
-                        continue
-                    df_t = _clean_ohlc(data[t])
-                else:
-                    # Single-ticker batch returns flat columns
-                    if len(batch) != 1:
-                        continue
-                    df_t = _clean_ohlc(data)
-
+                df_t = _extract_ticker_df(data, t, len(batch))
                 if df_t.empty:
                     continue
-
                 df_t["Ticker"] = t
                 df_t["Index"]  = label
                 all_frames.append(df_t.reset_index())
                 found.add(t)
-
             except Exception:
                 continue
 
