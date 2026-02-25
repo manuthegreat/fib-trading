@@ -840,51 +840,6 @@ def compute_buy_quality(row):
 
 
 # =========================================================
-# 9. WATCH READINESS SCORE
-# =========================================================
-def compute_watch_readiness(row):
-    """
-    How close the structure is to a valid BUY.
-    Applies to ALL signals.
-    BUY will get 100.
-    """
-    if row["FINAL_SIGNAL"] == "BUY":
-        return 100.0
-
-    # retracement
-    retr = 1 if row["Retr Held"] else 0
-
-    # HL formation
-    hl = 1 if row["HL Formed"] else 0
-
-    # candle
-    candle = 1 if row["Bullish Candle"] else 0
-
-    # momentum
-    mom = 1 if row["Momentum OK"] else 0
-
-    # BOS proximity
-    bos = row["LastLocalHigh"]
-    price = row["Latest Price"]
-    if np.isnan(bos):
-        bos_prox = 0
-    else:
-        bos_dist = bos - price
-        raw = 1 - bos_dist / max(price, 1e-9)
-        bos_prox = np.clip(raw, 0, 1)
-
-    score = 100 * (
-        0.25 * retr +
-        0.20 * hl +
-        0.15 * candle +
-        0.20 * mom +
-        0.20 * bos_prox
-    )
-
-    return round(np.clip(score, 0, 100), 2)
-
-
-# =========================================================
 # 10. PERFECT ENTRY, ENTRY BIAS & BREAKOUT PRESSURE
 # =========================================================
 def compute_perfect_entry(row):
@@ -968,8 +923,8 @@ def compute_perfect_entry(row):
         row["FINAL_SIGNAL"] == "BUY"
         and row["Retr Held"]
         and row["Momentum OK"]
-        and row["READINESS_SCORE"] >= 95
     ):
+        # readiness removed: bonus now depends on confirmed BUY structure only.
         score += 15  # push best BUYs like NCLH into the 90s
 
     # cap for INVALID setups
@@ -1104,9 +1059,10 @@ def generate_insight_tags(row):
     # ======================================================
     if (
         row["FINAL_SIGNAL"] == "WATCH"
-        and row["READINESS_SCORE"] >= 95
-        and row["BREAKOUT_PRESSURE"] >= 60
+        and row["BREAKOUT_PRESSURE"] >= 75
+        and row["ShapePriority"] <= 2
     ):
+        # readiness removed: PRIME now uses pressure + structure quality.
         tags.append("🔥 PRIME")
 
     # ======================================================
@@ -1143,7 +1099,7 @@ def generate_insight_tags(row):
         elif (
             row["FINAL_SIGNAL"] == "WATCH"
             and pe >= 90
-            and row["READINESS_SCORE"] >= 95
+            and row["BREAKOUT_PRESSURE"] >= 75
         ):
             tags.append("🎯 PERFECT_ENTRY")
 
@@ -1153,7 +1109,7 @@ def generate_insight_tags(row):
     if (
         row["FINAL_SIGNAL"] != "BUY"
         and row["ShapePriority"] <= 3
-        and row["READINESS_SCORE"] > 80
+        and row["BREAKOUT_PRESSURE"] > 55
     ):
         # quality filter → avoid noisy structures
         if g["MACDH"].iloc[-1] > 0 or price > recent["Close"].mean():
@@ -1394,7 +1350,7 @@ def run_engine():
 
     # Scores & NEXT_ACTION
     confirm["BUY_QUALITY"] = confirm.apply(compute_buy_quality, axis=1)
-    confirm["READINESS_SCORE"] = confirm.apply(compute_watch_readiness, axis=1)
+    # readiness removed: keep BUY quality and pressure metrics only.
     confirm["NEXT_ACTION"] = confirm.apply(next_action, axis=1)
 
     # Entry timing & pressure metrics
@@ -1405,7 +1361,7 @@ def run_engine():
     # Sorting logic (same as your script)
     confirm["SignalPriority"] = confirm["Shape"].apply(shape_priority)
     confirm["WatchPriority"] = confirm.apply(
-        lambda r: r["READINESS_SCORE"]
+        lambda r: r.get("BREAKOUT_PRESSURE", 0)
         if r["FINAL_SIGNAL"] == "WATCH"
         else -1,
         axis=1,
@@ -1439,7 +1395,7 @@ def run_engine():
 
     combined = confirm.copy()
     combined = combined.sort_values(
-        by=["READINESS_SCORE", "PERFECT_ENTRY", "BREAKOUT_PRESSURE"],
+        by=["BREAKOUT_PRESSURE", "PERFECT_ENTRY", "BUY_QUALITY"],
         ascending=[False, False, False]
     ).reset_index(drop=True)
 

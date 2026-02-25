@@ -1,9 +1,11 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from engine import run_engine, generate_trading_summary
+from ranking import rank_hourly_candidates
 
 
 # ---------------------------------------------------------
@@ -50,7 +52,7 @@ lookback_days = st.sidebar.slider(
 )
 
 st.sidebar.write("---")
-st.sidebar.write("Run this daily after market close / before open.")
+st.sidebar.write("Run this after market close / before open.")
 
 
 # -----------------------------
@@ -97,8 +99,31 @@ if df_view.empty:
 st.write("### Hourly Entry Candidates (List B)")
 
 if hourly_entries_df is not None and not hourly_entries_df.empty:
-    hourly_view = hourly_entries_df[[
+    price_lookup = {}
+    if combined is not None and not combined.empty and {"Ticker", "Latest Price"}.issubset(combined.columns):
+        price_lookup = combined.set_index("Ticker")["Latest Price"].to_dict()
+
+    hourly_rank_input = hourly_entries_df.copy()
+    hourly_rank_input["entry"] = pd.to_numeric(hourly_rank_input.get("entry_618"), errors="coerce")
+    hourly_rank_input["side"] = hourly_rank_input.get("side", "long")
+    hourly_rank_input["current_price"] = hourly_rank_input["Ticker"].map(price_lookup)
+    hourly_rank_input["current_price"] = hourly_rank_input["current_price"].fillna(
+        pd.to_numeric(hourly_rank_input.get("last_close"), errors="coerce")
+    )
+
+    # readiness removed: ranking now uses R:R only.
+    ranked_hourly = rank_hourly_candidates(hourly_rank_input, current_price_col="current_price")
+
+    top_n = st.slider("Top hourly setups", min_value=3, max_value=50, value=15, step=1)
+
+    hourly_view = ranked_hourly[[
         "Ticker",
+        "side",
+        "entry",
+        "stop",
+        "take_profit",
+        "rr",
+        "reward_from_current_pct",
         "DailyRetrLowDate",
         "DailyRetrLowPrice",
         "local_high_time",
@@ -106,14 +131,12 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
         "entry_382",
         "entry_50",
         "entry_618",
-        "stop",
-        "take_profit",
         "last_close",
         "retrace_from_high_pct",
         "bars_since_high",
         "distance_to_entry_618_pct",
         "entry_618_hit",
-    ]].copy()
+    ]].head(top_n).copy()
 
     hourly_view = hourly_view.rename(
         columns={
@@ -121,9 +144,12 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
             "DailyRetrLowPrice": "Daily Low",
             "local_high_time": "Hourly High Time",
             "local_high": "Hourly High",
+            "entry": "Entry",
             "entry_382": "Entry 38.2%",
             "entry_50": "Entry 50%",
             "entry_618": "Entry 61.8%",
+            "rr": "R:R",
+            "reward_from_current_pct": "Reward Left %",
             "take_profit": "Take Profit",
             "last_close": "Last Close",
             "retrace_from_high_pct": "Retrace % From High",
@@ -133,38 +159,28 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
         }
     )
 
-    hourly_event = st.dataframe(
+    st.dataframe(
         hourly_view,
         hide_index=True,
         use_container_width=True,
-        key="hourly_df",
-        on_select="rerun",
-        selection_mode="single-row",
+        key="hourly_ranked_df",
     )
 
-    hourly_selected_rows = []
-    if hourly_event is not None:
-        if hasattr(hourly_event, "selection") and hasattr(hourly_event.selection, "rows"):
-            hourly_selected_rows = hourly_event.selection.rows
-        elif hasattr(hourly_event, "rows"):
-            hourly_selected_rows = hourly_event.rows
-        elif isinstance(hourly_event, dict):
-            if "selection" in hourly_event and isinstance(hourly_event["selection"], dict):
-                hourly_selected_rows = hourly_event["selection"].get("rows", [])
-            else:
-                hourly_selected_rows = hourly_event.get("rows", [])
-
-    if "hourly_selected_ticker" not in st.session_state:
-        st.session_state.hourly_selected_ticker = None
-
-    if hourly_selected_rows:
-        hourly_selected_idx = hourly_selected_rows[0]
-        st.session_state.hourly_selected_ticker = hourly_entries_df.iloc[hourly_selected_idx]["Ticker"]
-
-    hourly_ticker_selected = st.session_state.hourly_selected_ticker
+    if not ranked_hourly.empty:
+        inspect_idx = st.number_input(
+            "Inspect hourly row index",
+            min_value=0,
+            max_value=max(len(ranked_hourly.head(top_n)) - 1, 0),
+            value=0,
+            step=1,
+        )
+        selected_row = ranked_hourly.head(top_n).iloc[int(inspect_idx)] if len(ranked_hourly.head(top_n)) else None
+        hourly_ticker_selected = selected_row.get("Ticker") if selected_row is not None else None
+    else:
+        hourly_ticker_selected = None
 
     if hourly_ticker_selected and hourly_df is not None and not hourly_df.empty:
-        selected_hourly_row = hourly_entries_df[hourly_entries_df["Ticker"] == hourly_ticker_selected]
+        selected_hourly_row = ranked_hourly[ranked_hourly["Ticker"] == hourly_ticker_selected]
         ticker_hourly = hourly_df[hourly_df["Ticker"] == hourly_ticker_selected].copy()
 
         if (not selected_hourly_row.empty) and (not ticker_hourly.empty):
@@ -260,7 +276,7 @@ with col2:
 with col3:
     st.metric("WATCH signals", (df_view["FINAL_SIGNAL"] == "WATCH").sum())
 with col4:
-    st.metric("Avg Readiness", f"{df_view['READINESS_SCORE'].mean():.1f}")
+    st.metric("Avg Breakout Pressure", f"{pd.to_numeric(df_view.get('BREAKOUT_PRESSURE'), errors='coerce').mean():.1f}")
 
 
 # ---------------------------------------------------------
@@ -311,7 +327,8 @@ if "selected_ticker" not in st.session_state:
 if selected_rows:
     # DataframeSelectionState.rows are integer positions in the original df
     selected_idx = selected_rows[0]
-    st.session_state.selected_ticker = ranked_table.iloc[selected_idx]["Ticker"]
+    if 0 <= selected_idx < len(ranked_table):
+        st.session_state.selected_ticker = ranked_table.iloc[selected_idx]["Ticker"]
 
 ticker_selected = st.session_state.selected_ticker
 
@@ -481,14 +498,21 @@ def render_summary_card(row, hourly_row=None):
     hourly_plan_html = ""
     if hourly_row is not None and not hourly_row.empty:
         hr = hourly_row.iloc[0]
+        entry_val = pd.to_numeric(pd.Series([hr.get("entry", hr.get("entry_618", np.nan))]), errors="coerce").iloc[0]
+        stop_val = pd.to_numeric(pd.Series([hr.get("stop", np.nan)]), errors="coerce").iloc[0]
+        tp_val = pd.to_numeric(pd.Series([hr.get("take_profit", np.nan)]), errors="coerce").iloc[0]
+        pullback_val = pd.to_numeric(pd.Series([hr.get("pullback_pct", hr.get("retrace_from_high_pct", np.nan))]), errors="coerce").iloc[0]
+        dist_val = pd.to_numeric(pd.Series([hr.get("distance_to_entry_pct", hr.get("distance_to_entry_618_pct", np.nan))]), errors="coerce").iloc[0]
+        hit_val = hr.get("entry_hit", hr.get("entry_618_hit", False))
+
         hourly_plan_html = f"""
 <h3 style=\"color:#4CC9F0; margin-bottom:5px;\">⏱️ Hourly Entry Plan</h3>
-<b>Entry:</b> {hr['entry']:.4f}<br>
-<b>Stop:</b> {hr['stop']:.4f}<br>
-<b>Take Profit:</b> {hr['take_profit']:.4f}<br>
-<b>Pullback:</b> {hr['pullback_pct']*100:.2f}%<br>
-<b>Distance to Entry:</b> {hr['distance_to_entry_pct']*100:.2f}%<br>
-<b>Entry Hit:</b> {bool(hr['entry_hit'])}<br><br>
+<b>Entry:</b> {entry_val:.4f}<br>
+<b>Stop:</b> {stop_val:.4f}<br>
+<b>Take Profit:</b> {tp_val:.4f}<br>
+<b>Pullback:</b> {pullback_val*100:.2f}%<br>
+<b>Distance to Entry:</b> {dist_val*100:.2f}%<br>
+<b>Entry Hit:</b> {bool(hit_val)}<br><br>
 """
 
     html = f"""
@@ -526,7 +550,11 @@ def render_summary_card(row, hourly_row=None):
 # Ticker Drilldown
 # ---------------------------------------------------------
 if ticker_selected:
-    row_sel = df_view[df_view["Ticker"] == ticker_selected].iloc[0]
+    selected_rows_df = df_view[df_view["Ticker"] == ticker_selected]
+    if selected_rows_df.empty:
+        st.warning("Selected ticker no longer available.")
+        st.stop()
+    row_sel = selected_rows_df.iloc[0]
 
     st.write(f"### 📌 Selected: **{ticker_selected}**")
 
@@ -534,7 +562,7 @@ if ticker_selected:
     with colA:
         st.metric("Signal", row_sel["FINAL_SIGNAL"])
     with colB:
-        st.metric("Readiness", f"{row_sel['READINESS_SCORE']:.2f}")
+        st.metric("Shape", row_sel.get("Shape", "N/A"))
     with colC:
         st.metric("Breakout Pressure", f"{row_sel['BREAKOUT_PRESSURE']:.2f}")
     with colD:
@@ -568,15 +596,8 @@ These are quick-glance labels that highlight strong structural or momentum chara
 
 ---
 
-### **Readiness Score**
-How close a setup is to a confirmed BUY, combining:
-- retracement depth  
-- higher low confirmation  
-- bullish reaction candle  
-- momentum alignment  
-- proximity to BOS  
-
-**100 = ready to break out any moment.**
+### **Ranking Note**
+Hourly candidates are ranked by actionable **Risk:Reward (R:R)** and remaining reward from the current price.
 
 ---
 
