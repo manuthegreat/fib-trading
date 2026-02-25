@@ -1,23 +1,21 @@
 """ updater.py — Yahoo-only, SP500 + HSI + Euro Stoxx 50
 
-Speed design:
+Optimised for Streamlit Cloud:
+  - NO threading (Streamlit Cloud CPU throttling makes threads slower,
+    and concurrent downloads exceed the 1 GB RAM limit causing silent
+    worker kills that show up as missing tickers)
   - Large batches (50 tickers/call) → only 11 round trips for SP500
-    instead of 63. yf.download() handles 50 tickers per call cleanly.
-  - 5 concurrent batch workers per universe via ThreadPoolExecutor.
-  - All 3 universes download simultaneously (top-level pool).
-  - Global semaphore caps Yahoo at MAX_CONCURRENT_YAHOO=5 simultaneous
-    requests — safe vs Yahoo's ~100 req/min rate limit.
-  - Minimal inter-batch sleep (0.5s) since few batches are needed.
+  - Sequential universes → peak RAM = 1 universe at a time
+  - Minimal sleep (Streamlit Cloud datacenter IPs rarely get throttled)
+  - Exponential backoff on failures
 
-Expected runtime: ~45-60s total (vs ~9 min fully sequential).
+Expected runtime on Streamlit Cloud: ~60-90 seconds total.
 """
 
 from __future__ import annotations
 
 import random
 import time
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
 from typing import Iterable, List, Optional
 
@@ -27,21 +25,13 @@ import yfinance as yf
 
 
 # ==========================================================
-# SETTINGS  — adjust here if Yahoo starts throttling
+# SETTINGS
 # ==========================================================
-BATCH_SIZE            = 50   # tickers per yf.download() call
-                              # sweet spot: 50 gives few round trips
-                              # without Yahoo silently dropping tickers
-MAX_CONCURRENT_YAHOO  = 5    # simultaneous Yahoo requests (global cap)
-INTRA_UNIVERSE_WORKERS = 5   # threads per universe download
-INTER_BATCH_SLEEP_S   = 0.5  # courtesy sleep between batches per worker
-BASE_SLEEP_S          = 1.5  # base for exponential backoff on retries
-MAX_RETRIES           = 3    # retries per batch / ticker
-
-# Global semaphore — shared across ALL threads and ALL universes.
-# No matter how many threads run, Yahoo never sees more than
-# MAX_CONCURRENT_YAHOO simultaneous requests.
-_yahoo_sem = threading.Semaphore(MAX_CONCURRENT_YAHOO)
+BATCH_SIZE          = 50    # tickers per yf.download() call
+INTER_BATCH_SLEEP_S = 0.3   # small sleep between batches (datacenter IPs
+                             # rarely get rate-limited by Yahoo)
+BASE_SLEEP_S        = 1.5   # base for exponential backoff
+MAX_RETRIES         = 3     # retries per batch / single ticker
 
 
 # ==========================================================
@@ -228,9 +218,9 @@ def _clean_ohlc(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _backoff_sleep(attempt: int, base: float = BASE_SLEEP_S) -> None:
-    """Exponential backoff with jitter."""
-    time.sleep(base * (2 ** (attempt - 1)) + random.uniform(0.1, 0.5))
+def _backoff_sleep(attempt: int) -> None:
+    """Exponential backoff with jitter: 1.5s, 3s, 6s ..."""
+    time.sleep(BASE_SLEEP_S * (2 ** (attempt - 1)) + random.uniform(0.1, 0.5))
 
 
 def _download_single_ticker(
@@ -238,23 +228,22 @@ def _download_single_ticker(
     period: str,
     interval: str,
 ) -> Optional[pd.DataFrame]:
-    """Single-ticker fallback with retries and semaphore."""
+    """Single-ticker fallback with retries."""
     for attempt in range(1, MAX_RETRIES + 1):
-        with _yahoo_sem:
-            try:
-                data = yf.download(
-                    tickers=ticker,
-                    period=period,
-                    interval=interval,
-                    auto_adjust=False,
-                    threads=False,
-                    progress=False,
-                )
-                data = _clean_ohlc(data)
-                if not data.empty:
-                    return data
-            except Exception as exc:
-                print(f"[WARN] {ticker} attempt {attempt}/{MAX_RETRIES}: {exc}")
+        try:
+            data = yf.download(
+                tickers=ticker,
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                threads=False,
+                progress=False,
+            )
+            data = _clean_ohlc(data)
+            if not data.empty:
+                return data
+        except Exception as exc:
+            print(f"[WARN] {ticker} attempt {attempt}/{MAX_RETRIES}: {exc}")
 
         if attempt < MAX_RETRIES:
             _backoff_sleep(attempt)
@@ -264,99 +253,7 @@ def _download_single_ticker(
 
 
 # ==========================================================
-# 3) BATCH DOWNLOAD WORKER  (runs in a thread)
-# ==========================================================
-
-def _download_batch(
-    batch: List[str],
-    label: str,
-    batch_num: int,
-    total_batches: int,
-    period: str,
-    interval: str,
-) -> List[pd.DataFrame]:
-    """
-    Download one batch. Called from a ThreadPoolExecutor worker.
-    Acquires _yahoo_sem before every Yahoo HTTP call.
-    """
-    frames: List[pd.DataFrame] = []
-    data     = pd.DataFrame()
-    last_exc = None
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        with _yahoo_sem:
-            try:
-                data = yf.download(
-                    tickers=batch,
-                    period=period,
-                    interval=interval,
-                    group_by="ticker",
-                    auto_adjust=False,
-                    threads=False,   # our own threading; disable yf internal
-                    progress=False,
-                )
-                last_exc = None
-                break
-            except Exception as exc:
-                last_exc = exc
-                print(f"[WARN] {label} batch {batch_num}/{total_batches} "
-                      f"attempt {attempt}/{MAX_RETRIES}: {exc}")
-
-        if attempt < MAX_RETRIES:
-            _backoff_sleep(attempt)
-
-    if last_exc is not None:
-        print(f"[WARN] {label} batch {batch_num} failed all retries")
-
-    # --- Extract per-ticker frames ---
-    found: set = set()
-
-    for t in batch:
-        try:
-            if isinstance(data.columns, pd.MultiIndex):
-                if t not in data.columns.get_level_values(0):
-                    continue
-                df_t = _clean_ohlc(data[t])
-            else:
-                # Single-ticker batch → flat columns
-                if len(batch) != 1:
-                    continue
-                df_t = _clean_ohlc(data)
-
-            if df_t.empty:
-                continue
-
-            df_t["Ticker"] = t
-            df_t["Index"]  = label
-            frames.append(df_t.reset_index())
-            found.add(t)
-
-        except Exception:
-            continue
-
-    # --- Per-ticker fallback for anything silently dropped ---
-    missing = [t for t in batch if t not in found]
-    if missing:
-        print(f"[INFO] {label} batch {batch_num}: "
-              f"single-ticker fallback for {len(missing)} tickers: {missing}")
-
-    for t in missing:
-        df_t = _download_single_ticker(t, period, interval)
-        if df_t is None or df_t.empty:
-            continue
-        df_t["Ticker"] = t
-        df_t["Index"]  = label
-        frames.append(df_t.reset_index())
-
-    # Courtesy sleep so workers don't all slam Yahoo simultaneously
-    # after finishing — small because batches are large and few
-    time.sleep(INTER_BATCH_SLEEP_S + random.uniform(0.0, 0.3))
-
-    return frames
-
-
-# ==========================================================
-# 4) UNIVERSE DOWNLOADER
+# 3) UNIVERSE DOWNLOADER  (sequential, memory-safe)
 # ==========================================================
 
 def download_yahoo_prices(
@@ -366,10 +263,11 @@ def download_yahoo_prices(
     interval: str = "1d",
 ) -> List[pd.DataFrame]:
     """
-    Download an entire universe using a thread pool.
-    Large BATCH_SIZE (50) keeps round-trips low.
-    INTRA_UNIVERSE_WORKERS threads process batches concurrently.
-    Global _yahoo_sem enforces MAX_CONCURRENT_YAHOO across all universes.
+    Download an entire universe in sequential batches of BATCH_SIZE.
+
+    Sequential (no threading) keeps peak RAM to ~1 batch at a time,
+    which is critical on Streamlit Cloud's 1 GB limit. Large batches
+    (50 tickers) minimise round trips — SP500 needs only 11 calls.
     """
     tickers = [str(t).strip() for t in tickers if str(t).strip()]
     if not tickers:
@@ -378,51 +276,102 @@ def download_yahoo_prices(
     batches       = _chunk(tickers, BATCH_SIZE)
     total_batches = len(batches)
     all_frames: List[pd.DataFrame] = []
+    failed: List[str] = []
 
     print(f"[INFO] {label}: {len(tickers)} tickers → "
-          f"{total_batches} batches of up to {BATCH_SIZE} "
-          f"({INTRA_UNIVERSE_WORKERS} workers)")
+          f"{total_batches} batches of up to {BATCH_SIZE}")
 
-    with ThreadPoolExecutor(max_workers=INTRA_UNIVERSE_WORKERS) as pool:
-        futures = {
-            pool.submit(
-                _download_batch,
-                batch, label, i + 1, total_batches, period, interval,
-            ): i
-            for i, batch in enumerate(batches)
-        }
+    for batch_num, batch in enumerate(batches, 1):
+        data     = pd.DataFrame()
+        last_exc = None
 
-        for future in as_completed(futures):
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
-                all_frames.extend(future.result())
+                data = yf.download(
+                    tickers=batch,
+                    period=period,
+                    interval=interval,
+                    group_by="ticker",
+                    auto_adjust=False,
+                    threads=False,
+                    progress=False,
+                )
+                last_exc = None
+                break
             except Exception as exc:
-                print(f"[ERROR] {label} batch {futures[future]}: {exc}")
+                last_exc = exc
+                print(f"[WARN] {label} batch {batch_num}/{total_batches} "
+                      f"attempt {attempt}/{MAX_RETRIES}: {exc}")
+                if attempt < MAX_RETRIES:
+                    _backoff_sleep(attempt)
 
-    tickers_got   = {
-        str(f["Ticker"].iloc[0])
-        for f in all_frames
-        if not f.empty and "Ticker" in f.columns
-    }
-    missing_count = len(tickers) - len(tickers_got)
-    status        = "✓" if missing_count == 0 else f"⚠ {missing_count} missing"
-    print(f"[INFO] {label} done — {len(tickers_got)} tickers  {status}")
+        if last_exc is not None:
+            print(f"[WARN] {label} batch {batch_num} failed all retries")
+
+        # --- Extract per-ticker frames from batch result ---
+        found: set = set()
+
+        for t in batch:
+            try:
+                if isinstance(data.columns, pd.MultiIndex):
+                    if t not in data.columns.get_level_values(0):
+                        continue
+                    df_t = _clean_ohlc(data[t])
+                else:
+                    # Single-ticker batch returns flat columns
+                    if len(batch) != 1:
+                        continue
+                    df_t = _clean_ohlc(data)
+
+                if df_t.empty:
+                    continue
+
+                df_t["Ticker"] = t
+                df_t["Index"]  = label
+                all_frames.append(df_t.reset_index())
+                found.add(t)
+
+            except Exception:
+                continue
+
+        # --- Single-ticker fallback for anything silently dropped ---
+        missing = [t for t in batch if t not in found]
+        if missing:
+            print(f"[INFO] {label} batch {batch_num}: "
+                  f"fallback for {len(missing)} tickers: {missing}")
+
+        for t in missing:
+            df_t = _download_single_ticker(t, period, interval)
+            if df_t is None or df_t.empty:
+                failed.append(t)
+                continue
+            df_t["Ticker"] = t
+            df_t["Index"]  = label
+            all_frames.append(df_t.reset_index())
+
+        time.sleep(INTER_BATCH_SLEEP_S)
+
+    if failed:
+        print(f"[WARN] {label}: no data for {len(failed)} tickers: {failed}")
+    else:
+        print(f"[INFO] {label}: complete ✓  ({len(tickers)} tickers)")
 
     return all_frames
 
 
 # ==========================================================
-# 5) MASTER LOAD FUNCTIONS
+# 4) MASTER LOAD FUNCTIONS
 # ==========================================================
 
 def load_all_market_data() -> pd.DataFrame:
     """
     Returns merged DAILY OHLC for SP500 + HSI + Euro Stoxx 50.
 
-    All three universes download concurrently. The shared semaphore
-    ensures Yahoo never sees more than MAX_CONCURRENT_YAHOO=5
-    simultaneous requests regardless of thread count.
+    Downloads universes sequentially to stay within Streamlit Cloud's
+    1 GB RAM limit. Each universe is fully downloaded and concatenated
+    before the next begins, so peak memory = ~1 universe at a time.
 
-    Target runtime: ~45-60 seconds.
+    Target runtime on Streamlit Cloud: ~60-90 seconds.
     """
     t0 = time.time()
 
@@ -432,26 +381,16 @@ def load_all_market_data() -> pd.DataFrame:
 
     print(f"[INFO] Universes — SP500: {len(sp500)}, "
           f"HSI: {len(hsi)}, EuroStoxx50: {len(eurostoxx)}")
-    print(f"[INFO] Downloading all universes in parallel "
-          f"(max {MAX_CONCURRENT_YAHOO} concurrent Yahoo calls)...")
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        fut_sp = pool.submit(
-            download_yahoo_prices,
-            sp500["Ticker"].tolist(), "SP500", "600d", "1d",
-        )
-        fut_hs = pool.submit(
-            download_yahoo_prices,
-            hsi["Ticker"].tolist(), "HSI", "600d", "1d",
-        )
-        fut_eu = pool.submit(
-            download_yahoo_prices,
-            eurostoxx["Ticker"].tolist(), "EUROSTOXX50", "600d", "1d",
-        )
-
-        sp_frames = fut_sp.result()
-        hs_frames = fut_hs.result()
-        eu_frames = fut_eu.result()
+    sp_frames = download_yahoo_prices(
+        sp500["Ticker"].tolist(), "SP500", period="600d", interval="1d"
+    )
+    hs_frames = download_yahoo_prices(
+        hsi["Ticker"].tolist(), "HSI", period="600d", interval="1d"
+    )
+    eu_frames = download_yahoo_prices(
+        eurostoxx["Ticker"].tolist(), "EUROSTOXX50", period="600d", interval="1d"
+    )
 
     all_frames = sp_frames + hs_frames + eu_frames
     if not all_frames:
