@@ -278,6 +278,18 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
                 height=500,
             )
             fig_hourly.update_xaxes(range=[window_start, window_end])
+
+            visible_hourly = ticker_hourly[
+                (ticker_hourly["DateTime"] >= window_start) & (ticker_hourly["DateTime"] <= window_end)
+            ]
+            if not visible_hourly.empty:
+                y_low = pd.to_numeric(visible_hourly["Low"], errors="coerce").min()
+                y_high = pd.to_numeric(visible_hourly["High"], errors="coerce").max()
+                if pd.notna(y_low) and pd.notna(y_high):
+                    y_span = y_high - y_low
+                    y_padding = max(y_span * 0.08, y_high * 0.002)
+                    fig_hourly.update_yaxes(range=[y_low - y_padding, y_high + y_padding])
+
             st.plotly_chart(fig_hourly, use_container_width=True)
 else:
     st.info("No hourly entry candidates found for current run.")
