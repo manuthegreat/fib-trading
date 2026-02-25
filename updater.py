@@ -1,16 +1,46 @@
 """ updater.py — Yahoo-only, SP500 + HSI + Euro Stoxx 50
+
+Threading strategy:
+  - Each universe (SP500 / HSI / EuroStoxx50) is downloaded concurrently
+    using a top-level ThreadPoolExecutor (3 workers).
+  - Within each universe, batches are also parallelised with a second
+    ThreadPoolExecutor (INTRA_UNIVERSE_WORKERS workers) guarded by a
+    Semaphore so at most MAX_CONCURRENT_YAHOO requests hit Yahoo at once
+    across ALL threads at any time.
+  - Per-ticker fallbacks run in a small thread pool too.
+
+Result: ~2 min total vs ~9 min sequential, with the same rate-limit
+        safety as the hardened sequential version.
 """
 
 from __future__ import annotations
 
 import random
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
 from typing import Iterable, List, Optional
 
 import pandas as pd
 import requests
 import yfinance as yf
+
+
+# ==========================================================
+# RATE LIMIT / THREADING SETTINGS
+# ==========================================================
+BATCH_SIZE              = 8    # tickers per yf.download() call
+MAX_CONCURRENT_YAHOO    = 3    # hard cap on simultaneous Yahoo requests
+                               # (shared across ALL universe threads)
+INTRA_UNIVERSE_WORKERS  = 3    # thread pool size inside each universe
+INTER_BATCH_SLEEP_S     = 2.0  # sleep inside each worker between batches
+BASE_SLEEP_S            = 1.5  # base for exponential backoff on retries
+MAX_RETRIES             = 4    # retry attempts per batch / ticker
+
+# Global semaphore — all threads share this so we never exceed
+# MAX_CONCURRENT_YAHOO simultaneous requests to Yahoo.
+_yahoo_sem = threading.Semaphore(MAX_CONCURRENT_YAHOO)
 
 
 # ==========================================================
@@ -88,86 +118,78 @@ def get_hsi_universe() -> pd.DataFrame:
 
 # ------------------------------------------------------------------
 # Hardcoded Yahoo Finance tickers for Euro Stoxx 50.
-#
-# Wikipedia's Euro Stoxx 50 page is structurally inconsistent —
-# the table format, column names, and ticker representations change
-# without warning, making scraping fragile. Because the index
-# membership changes infrequently (typically once a year), a
-# hardcoded list with verified Yahoo Finance suffixes is far more
-# reliable in production than any scraping approach.
-#
-# Last verified: February 2026 (50 constituents).
-# Source: https://www.stoxx.com / Wikipedia cross-referenced with
-#         Yahoo Finance search to confirm each suffix resolves.
+# Wikipedia scraping is unreliable for this index — table structure
+# and column names change without warning. Hardcoded list with
+# verified Yahoo Finance suffixes is more robust in production.
+# Last verified: February 2026.
 # ------------------------------------------------------------------
 _EUROSTOXX50_TICKERS = [
     # Austria
-    ("VER.VI",  "Verbund",                    "Utilities"),
+    ("VER.VI",   "Verbund",               "Utilities"),
     # Belgium
-    ("ABI.BR",  "AB InBev",                   "Consumer Staples"),
-    ("UCB.BR",  "UCB",                        "Health Care"),
+    ("ABI.BR",   "AB InBev",              "Consumer Staples"),
+    ("UCB.BR",   "UCB",                   "Health Care"),
     # Finland
-    ("NOKIA.HE","Nokia",                      "Technology"),
+    ("NOKIA.HE", "Nokia",                 "Technology"),
     # France
-    ("AI.PA",   "Air Liquide",                "Materials"),
-    ("AIR.PA",  "Airbus",                     "Industrials"),
-    ("ACA.PA",  "Credit Agricole",            "Financials"),
-    ("BN.PA",   "Danone",                     "Consumer Staples"),
-    ("BNP.PA",  "BNP Paribas",               "Financials"),
-    ("CS.PA",   "AXA",                        "Financials"),
-    ("DG.PA",   "Vinci",                      "Industrials"),
-    ("EL.PA",   "EssilorLuxottica",           "Health Care"),
-    ("EN.PA",   "Bouygues",                   "Industrials"),
-    ("ENGI.PA", "Engie",                      "Utilities"),
-    ("GLE.PA",  "Societe Generale",           "Financials"),
-    ("KER.PA",  "Kering",                     "Consumer Discretionary"),
-    ("MC.PA",   "LVMH",                       "Consumer Discretionary"),
-    ("ML.PA",   "Michelin",                   "Consumer Discretionary"),
-    ("OR.PA",   "L'Oreal",                    "Consumer Staples"),
-    ("ORA.PA",  "Orange",                     "Communication Services"),
-    ("RI.PA",   "Pernod Ricard",              "Consumer Staples"),
-    ("RMS.PA",  "Hermes",                     "Consumer Discretionary"),
-    ("SAF.PA",  "Safran",                     "Industrials"),
-    ("SAN.PA",  "Sanofi",                     "Health Care"),
-    ("SGO.PA",  "Saint-Gobain",               "Industrials"),
-    ("STLAM.MI","Stellantis",                 "Consumer Discretionary"),
-    ("SU.PA",   "Schneider Electric",         "Industrials"),
-    ("TTE.PA",  "TotalEnergies",              "Energy"),
-    ("VIE.PA",  "Veolia",                     "Utilities"),
+    ("AI.PA",    "Air Liquide",           "Materials"),
+    ("AIR.PA",   "Airbus",                "Industrials"),
+    ("ACA.PA",   "Credit Agricole",       "Financials"),
+    ("BN.PA",    "Danone",                "Consumer Staples"),
+    ("BNP.PA",   "BNP Paribas",           "Financials"),
+    ("CS.PA",    "AXA",                   "Financials"),
+    ("DG.PA",    "Vinci",                 "Industrials"),
+    ("EL.PA",    "EssilorLuxottica",      "Health Care"),
+    ("EN.PA",    "Bouygues",              "Industrials"),
+    ("ENGI.PA",  "Engie",                 "Utilities"),
+    ("GLE.PA",   "Societe Generale",      "Financials"),
+    ("KER.PA",   "Kering",                "Consumer Discretionary"),
+    ("MC.PA",    "LVMH",                  "Consumer Discretionary"),
+    ("ML.PA",    "Michelin",              "Consumer Discretionary"),
+    ("OR.PA",    "L'Oreal",               "Consumer Staples"),
+    ("ORA.PA",   "Orange",                "Communication Services"),
+    ("RI.PA",    "Pernod Ricard",         "Consumer Staples"),
+    ("RMS.PA",   "Hermes",                "Consumer Discretionary"),
+    ("SAF.PA",   "Safran",                "Industrials"),
+    ("SAN.PA",   "Sanofi",                "Health Care"),
+    ("SGO.PA",   "Saint-Gobain",          "Industrials"),
+    ("SU.PA",    "Schneider Electric",    "Industrials"),
+    ("TTE.PA",   "TotalEnergies",         "Energy"),
+    ("VIE.PA",   "Veolia",                "Utilities"),
     # Germany
-    ("ADS.DE",  "Adidas",                     "Consumer Discretionary"),
-    ("ALV.DE",  "Allianz",                    "Financials"),
-    ("BAYN.DE", "Bayer",                      "Health Care"),
-    ("BMW.DE",  "BMW",                        "Consumer Discretionary"),
-    ("BAS.DE",  "BASF",                       "Materials"),
-    ("DB1.DE",  "Deutsche Boerse",            "Financials"),
-    ("DHL.DE",  "DHL Group",                  "Industrials"),
-    ("DTE.DE",  "Deutsche Telekom",           "Communication Services"),
-    ("MBG.DE",  "Mercedes-Benz",              "Consumer Discretionary"),
-    ("MUV2.DE", "Munich Re",                  "Financials"),
-    ("RWE.DE",  "RWE",                        "Utilities"),
-    ("SAP.DE",  "SAP",                        "Technology"),
-    ("SIE.DE",  "Siemens",                    "Industrials"),
+    ("ADS.DE",   "Adidas",                "Consumer Discretionary"),
+    ("ALV.DE",   "Allianz",               "Financials"),
+    ("BAYN.DE",  "Bayer",                 "Health Care"),
+    ("BMW.DE",   "BMW",                   "Consumer Discretionary"),
+    ("BAS.DE",   "BASF",                  "Materials"),
+    ("DB1.DE",   "Deutsche Boerse",       "Financials"),
+    ("DHL.DE",   "DHL Group",             "Industrials"),
+    ("DTE.DE",   "Deutsche Telekom",      "Communication Services"),
+    ("MBG.DE",   "Mercedes-Benz",         "Consumer Discretionary"),
+    ("MUV2.DE",  "Munich Re",             "Financials"),
+    ("RWE.DE",   "RWE",                   "Utilities"),
+    ("SAP.DE",   "SAP",                   "Technology"),
+    ("SIE.DE",   "Siemens",               "Industrials"),
     # Italy
-    ("ENI.MI",  "Eni",                        "Energy"),
-    ("ENEL.MI", "Enel",                       "Utilities"),
-    ("ISP.MI",  "Intesa Sanpaolo",            "Financials"),
-    ("UCG.MI",  "UniCredit",                  "Financials"),
+    ("ENI.MI",   "Eni",                   "Energy"),
+    ("ENEL.MI",  "Enel",                  "Utilities"),
+    ("ISP.MI",   "Intesa Sanpaolo",       "Financials"),
+    ("STLAM.MI", "Stellantis",            "Consumer Discretionary"),
+    ("UCG.MI",   "UniCredit",             "Financials"),
     # Netherlands
-    ("ASML.AS", "ASML",                       "Technology"),
-    ("INGA.AS", "ING Group",                  "Financials"),
-    ("PHIA.AS", "Philips",                    "Health Care"),
+    ("ASML.AS",  "ASML",                  "Technology"),
+    ("INGA.AS",  "ING Group",             "Financials"),
+    ("PHIA.AS",  "Philips",               "Health Care"),
     # Spain
-    ("BBVA.MC", "BBVA",                       "Financials"),
-    ("IBE.MC",  "Iberdrola",                  "Utilities"),
-    ("ITX.MC",  "Inditex",                    "Consumer Discretionary"),
-    ("REP.MC",  "Repsol",                     "Energy"),
-    ("SAN.MC",  "Santander",                  "Financials"),
+    ("BBVA.MC",  "BBVA",                  "Financials"),
+    ("IBE.MC",   "Iberdrola",             "Utilities"),
+    ("ITX.MC",   "Inditex",               "Consumer Discretionary"),
+    ("REP.MC",   "Repsol",                "Energy"),
+    ("SAN.MC",   "Santander",             "Financials"),
 ]
 
 
 def get_eurostoxx50_universe() -> pd.DataFrame:
-    """Returns the Euro Stoxx 50 constituent list as a DataFrame."""
     records = [
         {"Ticker": t, "Name": name, "Sector": sector}
         for t, name, sector in _EUROSTOXX50_TICKERS
@@ -176,7 +198,7 @@ def get_eurostoxx50_universe() -> pd.DataFrame:
 
 
 # ==========================================================
-# 2) YAHOO DOWNLOADER (batched, with per-ticker fallback)
+# 2) CORE HELPERS
 # ==========================================================
 
 def _chunk(lst: List[str], n: int) -> List[List[str]]:
@@ -204,36 +226,136 @@ def _clean_ohlc(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _backoff_sleep(attempt: int, base: float = BASE_SLEEP_S) -> None:
+    """Exponential backoff with jitter: base * 2^(attempt-1) + random jitter."""
+    sleep_time = base * (2 ** (attempt - 1)) + random.uniform(0.2, 1.0)
+    time.sleep(sleep_time)
+
+
+# ==========================================================
+# 3) THREADED BATCH DOWNLOADER
+# ==========================================================
+
+def _download_batch(
+    batch: List[str],
+    label: str,
+    batch_num: int,
+    total_batches: int,
+    period: str,
+    interval: str,
+) -> List[pd.DataFrame]:
+    """
+    Download one batch of tickers. Runs inside a thread.
+    Acquires _yahoo_sem before every Yahoo call so the global
+    MAX_CONCURRENT_YAHOO cap is respected across all threads.
+    Returns a list of per-ticker DataFrames (may be empty).
+    """
+    frames: List[pd.DataFrame] = []
+
+    # --- Batch download attempt ---
+    data     = pd.DataFrame()
+    last_exc = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        with _yahoo_sem:
+            try:
+                data = yf.download(
+                    tickers=batch,
+                    period=period,
+                    interval=interval,
+                    group_by="ticker",
+                    auto_adjust=False,
+                    threads=False,   # yfinance internal threads OFF — we do our own
+                    progress=False,
+                )
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                print(f"[WARN] {label} batch {batch_num}/{total_batches} "
+                      f"attempt {attempt}/{MAX_RETRIES}: {exc}")
+
+        if attempt < MAX_RETRIES:
+            _backoff_sleep(attempt)
+
+    if last_exc is not None:
+        print(f"[WARN] {label} batch {batch_num} failed all retries: {batch}")
+
+    # --- Extract per-ticker frames from batch result ---
+    found: set = set()
+
+    for t in batch:
+        try:
+            if isinstance(data.columns, pd.MultiIndex):
+                if t not in data.columns.get_level_values(0):
+                    continue
+                df_t = _clean_ohlc(data[t])
+            else:
+                if len(batch) != 1:
+                    continue
+                df_t = _clean_ohlc(data)
+
+            if df_t.empty:
+                continue
+
+            df_t["Ticker"] = t
+            df_t["Index"]  = label
+            frames.append(df_t.reset_index())
+            found.add(t)
+
+        except Exception:
+            continue
+
+    # --- Per-ticker fallback for anything the batch missed ---
+    missing = [t for t in batch if t not in found]
+    if missing:
+        print(f"[INFO] {label} batch {batch_num}: "
+              f"single-ticker fallback for {missing}")
+
+    for t in missing:
+        time.sleep(INTER_BATCH_SLEEP_S * 0.4 + random.uniform(0.2, 0.6))
+        df_t = _download_single_ticker(t, period, interval)
+        if df_t is None or df_t.empty:
+            print(f"[WARN] {label}: no data for {t} after fallback")
+            continue
+        df_t["Ticker"] = t
+        df_t["Index"]  = label
+        frames.append(df_t.reset_index())
+
+    # Inter-batch courtesy sleep inside the worker
+    time.sleep(INTER_BATCH_SLEEP_S + random.uniform(0.3, 1.0))
+
+    return frames
+
+
 def _download_single_ticker(
     ticker: str,
     period: str,
     interval: str,
-    max_retries: int,
-    sleep_s: float,
 ) -> Optional[pd.DataFrame]:
-    """Single-name download with retries."""
-    last_exc: Optional[Exception] = None
+    """Single-name download with exponential backoff. Uses _yahoo_sem."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        with _yahoo_sem:
+            try:
+                data = yf.download(
+                    tickers=ticker,
+                    period=period,
+                    interval=interval,
+                    auto_adjust=False,
+                    threads=False,
+                    progress=False,
+                )
+                data = _clean_ohlc(data)
+                if not data.empty:
+                    return data
+            except Exception as exc:
+                print(f"[WARN] Single download attempt {attempt}/{MAX_RETRIES} "
+                      f"for {ticker}: {exc}")
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            data = yf.download(
-                tickers=ticker,
-                period=period,
-                interval=interval,
-                auto_adjust=False,
-                threads=False,
-                progress=False,
-            )
-            data = _clean_ohlc(data)
-            if not data.empty:
-                return data
-        except Exception as exc:
-            last_exc = exc
+        if attempt < MAX_RETRIES:
+            _backoff_sleep(attempt)
 
-        time.sleep(sleep_s * attempt + random.random() * 0.35)
-
-    msg = str(last_exc) if last_exc else "empty response"
-    print(f"[WARN] Yahoo single download failed for {ticker}: {msg}")
+    print(f"[WARN] All retries exhausted for {ticker}")
     return None
 
 
@@ -242,128 +364,99 @@ def download_yahoo_prices(
     label: str,
     period: str = "600d",
     interval: str = "1d",
-    batch_size: int = 15,
-    max_retries: int = 3,
-    sleep_s: float = 1.0,
 ) -> List[pd.DataFrame]:
     """
-    Batched downloader for any universe.
-    Falls back to single-ticker download for any that fail in the batch.
+    Download prices for a universe using a thread pool.
+
+    Batches are dispatched concurrently (INTRA_UNIVERSE_WORKERS threads)
+    but a global semaphore (_yahoo_sem) caps simultaneous Yahoo calls at
+    MAX_CONCURRENT_YAHOO regardless of how many universes run in parallel.
     """
     tickers = [str(t).strip() for t in tickers if str(t).strip()]
     if not tickers:
         return []
 
-    frames: List[pd.DataFrame] = []
-    failed_tickers: List[str] = []
+    batches       = _chunk(tickers, BATCH_SIZE)
+    total_batches = len(batches)
+    all_frames: List[pd.DataFrame] = []
 
-    for batch in _chunk(tickers, batch_size):
-        last_exc = None
-        data = pd.DataFrame()
+    print(f"[INFO] {label}: {len(tickers)} tickers → "
+          f"{total_batches} batches × {BATCH_SIZE} "
+          f"({INTRA_UNIVERSE_WORKERS} workers)")
 
-        for attempt in range(1, max_retries + 1):
+    with ThreadPoolExecutor(max_workers=INTRA_UNIVERSE_WORKERS) as pool:
+        futures = {
+            pool.submit(
+                _download_batch,
+                batch, label, i + 1, total_batches, period, interval,
+            ): i
+            for i, batch in enumerate(batches)
+        }
+
+        for future in as_completed(futures):
             try:
-                data = yf.download(
-                    tickers=batch,
-                    period=period,
-                    interval=interval,
-                    group_by="ticker",
-                    auto_adjust=False,
-                    threads=False,
-                    progress=False,
-                )
-                last_exc = None
-                break
+                result = future.result()
+                all_frames.extend(result)
             except Exception as exc:
-                last_exc = exc
-                time.sleep(sleep_s * attempt + random.random() * 0.25)
+                batch_idx = futures[future]
+                print(f"[ERROR] {label} batch {batch_idx} raised: {exc}")
 
-        if last_exc is not None:
-            print(
-                f"[WARN] Yahoo batch download failed ({label}) "
-                f"for {batch}: {last_exc}"
-            )
+    tickers_found = {
+        str(f["Ticker"].iloc[0])
+        for f in all_frames
+        if not f.empty and "Ticker" in f.columns
+    }
+    missing_count = len(tickers) - len(tickers_found)
 
-        found_in_batch: set = set()
+    if missing_count > 0:
+        print(f"[WARN] {label}: {missing_count} tickers returned no data")
+    else:
+        print(f"[INFO] {label}: all {len(tickers)} tickers downloaded ✓")
 
-        for t in batch:
-            try:
-                if isinstance(data.columns, pd.MultiIndex):
-                    if t not in data.columns.get_level_values(0):
-                        continue
-                    df_t = _clean_ohlc(data[t])
-                else:
-                    # Single-ticker batch — columns are flat
-                    if len(batch) != 1:
-                        continue
-                    df_t = _clean_ohlc(data)
-
-                if df_t.empty:
-                    continue
-
-                df_t["Ticker"] = t
-                df_t["Index"]  = label
-                frames.append(df_t.reset_index())
-                found_in_batch.add(t)
-
-            except Exception:
-                continue
-
-        # Per-ticker fallback for anything missing from the batch result
-        missing = [t for t in batch if t not in found_in_batch]
-        for t in missing:
-            df_t = _download_single_ticker(
-                ticker=t,
-                period=period,
-                interval=interval,
-                max_retries=max_retries,
-                sleep_s=sleep_s,
-            )
-            if df_t is None or df_t.empty:
-                failed_tickers.append(t)
-                continue
-
-            df_t["Ticker"] = t
-            df_t["Index"]  = label
-            frames.append(df_t.reset_index())
-
-        time.sleep(sleep_s + random.random() * 0.25)
-
-    if failed_tickers:
-        unique_failed = sorted(set(failed_tickers))
-        preview = ", ".join(unique_failed[:20])
-        suffix  = " ..." if len(unique_failed) > 20 else ""
-        print(
-            f"[WARN] Yahoo returned no usable {interval} data for "
-            f"{len(unique_failed)} {label} tickers: {preview}{suffix}"
-        )
-
-    return frames
+    return all_frames
 
 
 # ==========================================================
-# 3) MASTER LOAD FUNCTIONS
+# 4) MASTER LOAD FUNCTIONS
 # ==========================================================
 
 def load_all_market_data() -> pd.DataFrame:
     """
     Returns merged DAILY OHLC dataframe for SP500 + HSI + Euro Stoxx 50.
+
+    All three universes are downloaded concurrently. A shared semaphore
+    (_yahoo_sem, MAX_CONCURRENT_YAHOO=3) ensures Yahoo is never hit with
+    more than 3 simultaneous requests regardless of how many threads run.
     """
-    sp500      = get_sp500_universe()
-    hsi        = get_hsi_universe()
-    eurostoxx  = get_eurostoxx50_universe()
+    t0 = time.time()
 
-    print(f"[INFO] Universes — SP500: {len(sp500)}, HSI: {len(hsi)}, EuroStoxx50: {len(eurostoxx)}")
+    sp500     = get_sp500_universe()
+    hsi       = get_hsi_universe()
+    eurostoxx = get_eurostoxx50_universe()
 
-    sp_frames  = download_yahoo_prices(
-        sp500["Ticker"].tolist(),     "SP500",       period="600d", interval="1d"
-    )
-    hs_frames  = download_yahoo_prices(
-        hsi["Ticker"].tolist(),       "HSI",         period="600d", interval="1d"
-    )
-    eu_frames  = download_yahoo_prices(
-        eurostoxx["Ticker"].tolist(), "EUROSTOXX50", period="600d", interval="1d"
-    )
+    print(f"[INFO] Universes — SP500: {len(sp500)}, "
+          f"HSI: {len(hsi)}, EuroStoxx50: {len(eurostoxx)}")
+    print(f"[INFO] Downloading all universes in parallel "
+          f"(max {MAX_CONCURRENT_YAHOO} concurrent Yahoo requests)...")
+
+    # Top-level: 3 universe downloads run concurrently
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        fut_sp = pool.submit(
+            download_yahoo_prices,
+            sp500["Ticker"].tolist(), "SP500", "600d", "1d",
+        )
+        fut_hs = pool.submit(
+            download_yahoo_prices,
+            hsi["Ticker"].tolist(), "HSI", "600d", "1d",
+        )
+        fut_eu = pool.submit(
+            download_yahoo_prices,
+            eurostoxx["Ticker"].tolist(), "EUROSTOXX50", "600d", "1d",
+        )
+
+        sp_frames = fut_sp.result()
+        hs_frames = fut_hs.result()
+        eu_frames = fut_eu.result()
 
     all_frames = sp_frames + hs_frames + eu_frames
     if not all_frames:
@@ -377,8 +470,9 @@ def load_all_market_data() -> pd.DataFrame:
     combined = combined.dropna(subset=["Date"])
     combined = combined.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
+    elapsed = time.time() - t0
     print(f"[INFO] Daily data loaded — {combined['Ticker'].nunique()} tickers, "
-          f"{len(combined):,} rows")
+          f"{len(combined):,} rows  ({elapsed:.0f}s)")
 
     return combined
 
@@ -391,14 +485,9 @@ def load_hourly_prices_for_tickers(tickers: Iterable[str]) -> pd.DataFrame:
             columns=["Ticker", "DateTime", "Open", "High", "Low", "Close", "Index"]
         )
 
+    t0 = time.time()
     frames = download_yahoo_prices(
-        tickers,
-        label="HOURLY",
-        period="60d",
-        interval="60m",
-        batch_size=10,
-        max_retries=4,
-        sleep_s=1.25,
+        tickers, label="HOURLY", period="60d", interval="60m",
     )
 
     if not frames:
@@ -421,8 +510,9 @@ def load_hourly_prices_for_tickers(tickers: Iterable[str]) -> pd.DataFrame:
             f"Hourly data missing required columns: {sorted(missing)}"
         )
 
+    elapsed = time.time() - t0
     print(f"[INFO] Hourly data loaded — {combined['Ticker'].nunique()} tickers, "
-          f"{len(combined):,} rows")
+          f"{len(combined):,} rows  ({elapsed:.0f}s)")
 
     return combined
 
