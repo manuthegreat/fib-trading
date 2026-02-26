@@ -600,10 +600,29 @@ def build_hourly_entries(
     min_bars_since_high=3,
 ):
     """
-    Build hourly entry candidates from DAILY-qualified tickers (combined/List A).
+    Build hourly entry candidates from DAILY-qualified tickers.
+
+    LOGIC (inverse of daily):
+      Daily engine:  High first → find Low below → price retracing DOWN toward low
+      Hourly engine: Low is GIVEN (daily retracement low) → find swing High above it
+                     → price pulling back DOWN from that high → enter the pullback
+
+    Step-by-step:
+      1. Anchor low  = daily retracement low (already found, passed in via combined)
+      2. Swing high  = most recent confirmed pivot high on hourly chart AFTER anchor low
+                       (pivot = local max with at least min_bars_since_high bars after it)
+      3. Fib levels  = measured bottom-up: from anchor_low → swing_high
+                       entry_382 = swing_high - 0.382 * range
+                       entry_50  = swing_high - 0.500 * range
+                       entry_618 = swing_high - 0.618 * range  ← primary entry
+      4. Stop        = anchor_low (daily low)
+      5. Target      = swing_high
+      6. Valid setup = current price has pulled back from high and is between
+                       entry_382 and stop (i.e. inside the fib zone)
+
     Returns:
-    - hourly_entries_df: actionable hourly candidates
-    - hourly_rejects_df: optional diagnostics for rejected tickers
+      hourly_entries_df  — actionable candidates sorted by proximity to entry
+      hourly_rejects_df  — diagnostic reject log
     """
     if combined is None or combined.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -614,180 +633,215 @@ def build_hourly_entries(
         return pd.DataFrame(), rejects
 
     required_combined = {"Ticker", "DailyRetrLowDate", "DailyRetrLowPrice"}
-    required_hourly = {"Ticker", "DateTime", "Open", "High", "Low", "Close"}
+    required_hourly   = {"Ticker", "DateTime", "Open", "High", "Low", "Close"}
 
     if required_combined.difference(combined.columns):
         raise RuntimeError(
-            "combined dataframe missing required daily retracement columns for hourly scan"
+            "combined missing required daily retracement columns for hourly scan"
         )
     if required_hourly.difference(hourly_df.columns):
-        raise RuntimeError("hourly dataframe missing required OHLC columns")
+        raise RuntimeError("hourly_df missing required OHLC columns")
 
     entries = []
     rejects = []
-
-    # Kept for signature stability.
-    _ = near_entry_tol
-    _ = pivot_look
-    _ = min_hh_count
 
     hourly = hourly_df.copy()
     hourly["DateTime"] = pd.to_datetime(hourly["DateTime"], errors="coerce")
     hourly = hourly.dropna(subset=["DateTime"]).copy()
 
     if getattr(hourly["DateTime"].dt, "tz", None) is not None:
-        hourly["DateTime"] = hourly["DateTime"].dt.tz_convert("UTC").dt.tz_localize(None)
+        hourly["DateTime"] = (
+            hourly["DateTime"].dt.tz_convert("UTC").dt.tz_localize(None)
+        )
 
     hourly = hourly.sort_values(["Ticker", "DateTime"])
 
     for _, row in combined.iterrows():
-        ticker = row["Ticker"]
-        retr_low_date = pd.to_datetime(row["DailyRetrLowDate"], errors="coerce")
-        retr_low_price = float(row["DailyRetrLowPrice"])
+        ticker         = row["Ticker"]
+        anchor_low_px  = float(row["DailyRetrLowPrice"])
+        anchor_low_dt  = pd.to_datetime(row["DailyRetrLowDate"], errors="coerce")
+
+        if pd.isna(anchor_low_dt):
+            rejects.append({"Ticker": ticker, "RejectReason": "invalid_daily_low_datetime"})
+            continue
+
+        # Normalise timezone
+        if anchor_low_dt.tzinfo is not None:
+            anchor_low_dt = anchor_low_dt.tz_convert("UTC").tz_localize(None)
 
         g = hourly[hourly["Ticker"] == ticker].copy()
         if g.empty:
             rejects.append({"Ticker": ticker, "RejectReason": "missing_hourly_data"})
             continue
 
-        if pd.isna(retr_low_date):
-            rejects.append({"Ticker": ticker, "RejectReason": "invalid_daily_low_datetime"})
-            continue
+        # All hourly bars AFTER the daily anchor low
+        after_low = g[g["DateTime"] > anchor_low_dt].copy().reset_index(drop=True)
 
-        if getattr(g["DateTime"].dt, "tz", None) is not None and retr_low_date.tzinfo is None:
-            retr_low_date = retr_low_date.tz_localize("UTC").tz_localize(None)
-        elif getattr(g["DateTime"].dt, "tz", None) is None and retr_low_date.tzinfo is not None:
-            retr_low_date = retr_low_date.tz_convert("UTC").tz_localize(None)
-        elif retr_low_date.tzinfo is not None:
-            retr_low_date = retr_low_date.tz_convert("UTC").tz_localize(None)
-
-        after_low = g[g["DateTime"] > retr_low_date].copy()
         if after_low.empty:
             rejects.append({"Ticker": ticker, "RejectReason": "no_hourly_after_daily_low"})
             continue
 
         if len(after_low) > max_bars_after_low:
-            after_low = after_low.tail(max_bars_after_low).copy()
+            after_low = after_low.tail(max_bars_after_low).copy().reset_index(drop=True)
 
-        if len(after_low) < 20:
+        if len(after_low) < 10:
             rejects.append({"Ticker": ticker, "RejectReason": "insufficient_hourly_bars"})
             continue
 
-        prev_close = after_low["Close"].shift(1)
-        tr1 = after_low["High"] - after_low["Low"]
-        tr2 = (after_low["High"] - prev_close).abs()
-        tr3 = (after_low["Low"] - prev_close).abs()
-        true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr14 = true_range.rolling(14).mean()
-
-        impulse_move = after_low["Close"] - after_low["Close"].shift(6)
-        impulse_mask = impulse_move > (1.2 * atr14)
-
-        impulse_indices = after_low.index[impulse_mask.fillna(False)]
-        if len(impulse_indices) == 0:
-            rejects.append({"Ticker": ticker, "RejectReason": "no_impulse_bar"})
+        # ----------------------------------------------------------------
+        # STEP 2: find the most recent confirmed swing HIGH after anchor low
+        #
+        # "Confirmed" means at least min_bars_since_high bars have formed
+        # after the candidate high (so we know price has turned down from it).
+        # We scan backwards from the end of the eligible segment so we always
+        # pick the most recent meaningful pivot.
+        # ----------------------------------------------------------------
+        # Eligible = all bars except the last min_bars_since_high
+        # (those are the "confirmation tail" — the pullback bars)
+        n = len(after_low)
+        if n <= min_bars_since_high + 2:
+            rejects.append({"Ticker": ticker, "RejectReason": "insufficient_hourly_bars"})
             continue
 
-        impulse_idx = impulse_indices[-1]
-        impulse_pos = after_low.index.get_loc(impulse_idx)
-        window_start = max(0, impulse_pos - 1)
-        window_end = min(len(after_low), impulse_pos + 2)
-        local_window = after_low.iloc[window_start:window_end]
+        eligible = after_low.iloc[: n - min_bars_since_high]
+        h_vals   = eligible["High"].values
+        h_dts    = eligible["DateTime"].values
 
-        if local_window.empty:
-            rejects.append({"Ticker": ticker, "RejectReason": "invalid_impulse_window"})
+        # 5-bar pivot: h[i] is highest in a ±5 bar window
+        lk = min(5, (len(h_vals) - 1) // 2)
+        if lk < 1:
+            rejects.append({"Ticker": ticker, "RejectReason": "insufficient_hourly_bars"})
             continue
 
-        if len(after_low) <= min_bars_since_high:
-            rejects.append({"Ticker": ticker, "RejectReason": "high_too_recent"})
+        # ----------------------------------------------------------------
+        # Find the HIGHEST pivot high in the eligible window.
+        #
+        # WHY HIGHEST, NOT MOST RECENT:
+        #   The Fibonacci retracement must be measured from the peak of the
+        #   rally that started at anchor_low. A "most recent pivot" scan
+        #   breaks whenever a minor bounce forms AFTER the dominant high:
+        #
+        #   NVR example:
+        #     Anchor low : ~7000 (Jan 11)
+        #     True high  :  8200 (Feb 8)   ← dominant rally peak
+        #     Minor bounce: 7703 (Feb 22)  ← most recent pivot, but WRONG
+        #     Scan backwards → hits 7703 first → breaks → misses 8200
+        #
+        #   Using the HIGHEST pivot gives 8200 → correct Fibonacci levels:
+        #     38.2% = 7742, 50% = 7600, 61.8% = 7458  (price ~7500 = in zone ✓)
+        #
+        #   The highest pivot IS the swing high of the wave from anchor_low.
+        #   Minor bounces after it are just noise — they don't change where
+        #   the dominant Fibonacci levels sit.
+        # ----------------------------------------------------------------
+        best_pivot_price = None
+        best_pivot_time  = None
+
+        for i in range(lk, len(h_vals) - lk):
+            window = h_vals[max(0, i - lk): i + lk + 1]
+            if h_vals[i] == max(window) and h_vals[i] > anchor_low_px:
+                if best_pivot_price is None or h_vals[i] > best_pivot_price:
+                    best_pivot_price = float(h_vals[i])
+                    best_pivot_time  = pd.to_datetime(h_dts[i])
+
+        if best_pivot_price is not None:
+            swing_high      = best_pivot_price
+            swing_high_time = best_pivot_time
+        else:
+            # No pivot found at all — fallback to absolute max of eligible segment
+            best = eligible["High"].idxmax()
+            swing_high      = float(eligible.loc[best, "High"])
+            swing_high_time = pd.to_datetime(eligible.loc[best, "DateTime"])
+
+        if swing_high <= anchor_low_px:
+            rejects.append({"Ticker": ticker, "RejectReason": "swing_high_below_anchor_low"})
             continue
 
-        eligible = after_low.iloc[:-min_bars_since_high]
-        if eligible.empty:
-            rejects.append({"Ticker": ticker, "RejectReason": "high_too_recent"})
-            continue
-
-        # Keep the final assignment that originally won in the prior code path.
-        local_idx = local_window["High"].idxmax()
-        local_high = float(local_window.loc[local_idx, "High"])
-        local_high_time = pd.to_datetime(local_window.loc[local_idx, "DateTime"])
-
-        last_bar = after_low.iloc[-1]
-        last_close = float(last_bar["Close"])
-        last_low = float(last_bar["Low"])
-        last_high = float(last_bar["High"])
-
-        if len(after_low) < 2:
-            rejects.append({"Ticker": ticker, "RejectReason": "insufficient_recent_bars"})
-            continue
-
-        previous_close = float(after_low.iloc[-2]["Close"])
-        currently_pulling_back = (last_close < local_high) and (last_close < previous_close)
-        if not currently_pulling_back:
-            # Intentionally keep: reject reason appended without continue to preserve behavior.
-            rejects.append({"Ticker": ticker, "RejectReason": "not_currently_pulling_back"})
-
-        bars_since_high = int((after_low["DateTime"] > local_high_time).sum())
-        if bars_since_high < 3:
-            rejects.append({"Ticker": ticker, "RejectReason": "high_too_recent"})
-            continue
-
-        retrace_from_high_pct = (local_high - last_close) / local_high
-        retracing_now = (
-            (last_close < local_high)
-            and (retrace_from_high_pct >= min_pullback_pct)
-            and (retrace_from_high_pct <= max_pullback_pct)
-        )
-        if not retracing_now:
-            rejects.append({"Ticker": ticker, "RejectReason": "no_pullback"})
-            continue
-
-        fib_low = retr_low_price
-        fib_high = local_high
-        entry_382 = fib_high - 0.382 * (fib_high - fib_low)
-        entry_50 = fib_high - 0.50 * (fib_high - fib_low)
-        entry_618 = fib_high - 0.618 * (fib_high - fib_low)
-        stop = fib_low
-        take_profit = fib_high
+        # ----------------------------------------------------------------
+        # STEP 3: Fibonacci levels (bottom-up: anchor_low → swing_high)
+        # ----------------------------------------------------------------
+        fib_range = swing_high - anchor_low_px
+        entry_382 = swing_high - 0.382 * fib_range
+        entry_50  = swing_high - 0.500 * fib_range
+        entry_618 = swing_high - 0.618 * fib_range
+        stop      = anchor_low_px          # stop = daily anchor low
+        take_profit = swing_high           # target = back to swing high
 
         if not (stop < entry_618 < take_profit):
             rejects.append({"Ticker": ticker, "RejectReason": "invalid_trade_levels"})
             continue
 
+        # ----------------------------------------------------------------
+        # STEP 4: Check current price is pulling back from the swing high
+        # ----------------------------------------------------------------
+        last_bar   = after_low.iloc[-1]
+        last_close = float(last_bar["Close"])
+        last_low   = float(last_bar["Low"])
+        last_high  = float(last_bar["High"])
+
+        bars_since_high = int((after_low["DateTime"] > swing_high_time).sum())
+        if bars_since_high < min_bars_since_high:
+            rejects.append({"Ticker": ticker, "RejectReason": "high_too_recent"})
+            continue
+
+        retrace_from_high_pct = (swing_high - last_close) / swing_high
+
+        # Must be pulling back (below swing high) and within fib zone
+        # i.e. between entry_382 (shallow) and stop (deep)
+        in_fib_zone = (last_close <= entry_382) and (last_close >= stop)
+        pulling_back = last_close < swing_high
+
+        if not (pulling_back and in_fib_zone):
+            rejects.append({
+                "Ticker": ticker,
+                "RejectReason": (
+                    "no_pullback" if not pulling_back
+                    else f"outside_fib_zone (close={last_close:.2f}, "
+                         f"entry_382={entry_382:.2f}, stop={stop:.2f})"
+                ),
+            })
+            continue
+
+        # ----------------------------------------------------------------
+        # STEP 5: Entry hit detection and distance to primary entry (61.8%)
+        # ----------------------------------------------------------------
         distance_to_entry_618_pct = (last_close - entry_618) / entry_618
         entry_618_hit = (last_low <= entry_618) and (entry_618 <= last_high)
 
-        entries.append(
-            {
-                "Ticker": ticker,
-                "DailyRetrLowDate": retr_low_date,
-                "DailyRetrLowPrice": fib_low,
-                "local_high_time": local_high_time,
-                "local_high": fib_high,
-                "entry_382": entry_382,
-                "entry_50": entry_50,
-                "entry_618": entry_618,
-                "stop": stop,
-                "take_profit": take_profit,
-                "last_close": last_close,
-                "last_low": last_low,
-                "last_high": last_high,
-                "retrace_from_high_pct": retrace_from_high_pct,
-                "bars_since_high": bars_since_high,
-                "distance_to_entry_618_pct": distance_to_entry_618_pct,
-                "entry_618_hit": bool(entry_618_hit),
-            }
-        )
+        entries.append({
+            "Ticker":                    ticker,
+            "DailyRetrLowDate":          anchor_low_dt,
+            "DailyRetrLowPrice":         anchor_low_px,
+            "local_high_time":           swing_high_time,
+            "local_high":                swing_high,
+            "entry_382":                 entry_382,
+            "entry_50":                  entry_50,
+            "entry_618":                 entry_618,
+            "stop":                      stop,
+            "take_profit":               take_profit,
+            "last_close":                last_close,
+            "last_low":                  last_low,
+            "last_high":                 last_high,
+            "retrace_from_high_pct":     retrace_from_high_pct,
+            "bars_since_high":           bars_since_high,
+            "distance_to_entry_618_pct": distance_to_entry_618_pct,
+            "entry_618_hit":             bool(entry_618_hit),
+        })
 
     entries_df = pd.DataFrame(entries)
     rejects_df = pd.DataFrame(rejects)
 
     if not entries_df.empty:
-        entries_df["abs_distance_to_entry_618_pct"] = entries_df["distance_to_entry_618_pct"].abs()
-        entries_df = entries_df.sort_values(
-            by=["entry_618_hit", "abs_distance_to_entry_618_pct", "retrace_from_high_pct"],
-            ascending=[False, True, False],
-        ).drop(columns=["abs_distance_to_entry_618_pct"]).reset_index(drop=True)
+        entries_df["abs_dist"] = entries_df["distance_to_entry_618_pct"].abs()
+        entries_df = (
+            entries_df
+            .sort_values(
+                by=["entry_618_hit", "abs_dist"],
+                ascending=[False, True],
+            )
+            .drop(columns=["abs_dist"])
+            .reset_index(drop=True)
+        )
 
     return entries_df, rejects_df
 
