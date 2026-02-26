@@ -185,16 +185,29 @@ def build_watchlist(df, lookback_days=LOOKBACK_DAYS):
         if swing is None:
             continue
 
-        # Check if price broke below 78.6%
+        # DAILY INVALIDATION: two levels
+        #
+        # Level 1 (watchlist filter): price broke below 78.6% of the daily
+        #   swing → setup too deep, no longer a valid Fibonacci pullback.
+        #   Remove from watchlist entirely.
+        #
+        # Level 2 (step 4 of strategy): price broke below the swing LOW
+        #   itself → the entire wave is negated, structural failure.
+        #   This is caught by the 78.6% check above (since 78.6% > low),
+        #   but we also explicitly check the raw swing low so the reject
+        #   reason is clear in diagnostics.
         post_high = group[
             (group["Date"] > swing["Swing High Date"])
             & (group["Date"] <= latest_date)
         ]
 
-        if (not post_high.empty) and (
-            post_high["Low"] < swing["Stop Consider (78.6%)"]
-        ).any():
-            continue
+        if not post_high.empty:
+            # Broke below swing low → structural failure (step 4 invalidation)
+            if (post_high["Low"] < swing["Swing Low Price"]).any():
+                continue
+            # Broke below 78.6% → too deep, no longer a valid pullback
+            if (post_high["Low"] < swing["Stop Consider (78.6%)"]).any():
+                continue
 
         retracement = (swing["Swing High Price"] - latest_price) / (
             swing["Swing High Price"] - swing["Swing Low Price"]
@@ -686,6 +699,24 @@ def build_hourly_entries(
 
         if len(after_low) < 10:
             rejects.append({"Ticker": ticker, "RejectReason": "insufficient_hourly_bars"})
+            continue
+
+        # ----------------------------------------------------------------
+        # STEP 1: INVALIDATION CHECK — has price broken below the anchor low?
+        #
+        # If ANY hourly bar after the daily low has traded BELOW anchor_low_px,
+        # the setup is structurally broken. The daily retracement support has
+        # failed → this ticker goes back to step 2 (daily re-scan).
+        # There is no point calculating Fibonacci levels on a broken setup.
+        # ----------------------------------------------------------------
+        if after_low["Low"].min() < anchor_low_px:
+            rejects.append({
+                "Ticker": ticker,
+                "RejectReason": (
+                    f"anchor_low_broken: hourly low "
+                    f"{after_low['Low'].min():.2f} < anchor {anchor_low_px:.2f}"
+                ),
+            })
             continue
 
         # ----------------------------------------------------------------
