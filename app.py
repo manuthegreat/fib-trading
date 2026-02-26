@@ -3,277 +3,252 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from typing import Tuple
 
 from engine import run_engine, generate_trading_summary
 
 
-def _safe_float(value: object) -> float:
-    """Convert a scalar value to float, returning NaN for invalid values."""
-    try:
-        if value is None:
-            return np.nan
-        return float(value)
-    except (TypeError, ValueError):
-        return np.nan
+# ==========================================================
+# FOCUS SCORE — ranks hourly candidates by actionability
+# ==========================================================
 
-
-def compute_rr_for_row(row: pd.Series) -> Tuple[float, float]:
-    """Compute risk:reward ratio and remaining reward percentage for a row.
-
-    Expected keys:
-    - entry
-    - stop
-    - take_profit
-    Optional keys:
-    - side (defaults to "long")
-    - current_price
+def compute_focus_score(row: pd.Series) -> float:
     """
-    entry = _safe_float(row.get("entry"))
-    stop = _safe_float(row.get("stop"))
-    take_profit = _safe_float(row.get("take_profit"))
-    current_price = _safe_float(row.get("current_price"))
-    side = str(row.get("side", "long")).strip().lower()
+    Composite score (0-100) answering: "what should I look at first?"
 
-    if np.isnan(entry) or np.isnan(stop) or np.isnan(take_profit):
-        return (np.nan, np.nan)
+    Component                      Weight   Rationale
+    ----------------------------   ------   ------------------------------------
+    Entry proximity (61.8% dist)     30%    Closest to entry = most urgent
+    Entry hit bonus                 +15pt   Price IS at the zone right now
+    R:R ratio (capped at 5:1)        25%    Quality of the trade
+    Daily signal (BUY/WATCH)         20%    Daily timeframe confirmation
+    Breakout pressure (0-100)        15%    Structural energy from daily engine
+    Shape quality (1-7 priority)     10%    Clean structure preferred
+    """
+    score = 0.0
 
-    if side == "short":
-        risk = stop - entry
-        reward = entry - take_profit
-        if np.isnan(current_price):
-            reward_from_current_pct = np.nan
-        else:
-            remaining_reward = max(current_price - take_profit, 0.0)
-            reward_from_current_pct = (
-                remaining_reward / reward if reward > 0 else np.nan
-            )
+    # --- 1. Entry proximity (30pts) ---
+    # distance_to_entry_618_pct:
+    #   ~0       = price AT entry         → act now
+    #   positive = price above entry      → pulling back toward it
+    #   negative = price below entry      → overshot / missed
+    dist = float(row.get("distance_to_entry_618_pct", 0.10))
+    hit  = bool(row.get("entry_618_hit", False))
+
+    if hit:
+        proximity_score = 30.0
+    elif dist > 0:
+        # Above entry: linear decay — 0% away=30pts, 10%+ away=0pts
+        proximity_score = 30.0 * max(0.0, 1.0 - dist / 0.10)
     else:
-        risk = entry - stop
-        reward = take_profit - entry
-        if np.isnan(current_price):
-            reward_from_current_pct = np.nan
-        else:
-            remaining_reward = max(take_profit - current_price, 0.0)
-            reward_from_current_pct = (
-                remaining_reward / reward if reward > 0 else np.nan
-            )
+        # Below entry (overshot): rapid decay — 0%=30pts, -5%=0pts
+        proximity_score = 30.0 * max(0.0, 1.0 + dist / 0.05)
 
-    if risk == 0 or risk < 0 or reward <= 0:
-        return (np.nan, np.nan)
+    score += proximity_score
 
-    rr = reward / risk
-    return (rr, reward_from_current_pct)
+    # --- 2. Entry hit bonus (+15pts) ---
+    if hit:
+        score += 15.0
+
+    # --- 3. R:R (25pts, capped at 5:1) ---
+    rr = float(row.get("rr", np.nan))
+    if not np.isnan(rr) and rr > 0:
+        score += 25.0 * min(rr / 5.0, 1.0)
+
+    # --- 4. Daily signal quality (20pts) ---
+    signal = str(row.get("FINAL_SIGNAL", "WATCH"))
+    score += {"BUY": 20.0, "WATCH": 12.0, "INVALID": 0.0}.get(signal, 12.0)
+
+    # --- 5. Breakout pressure from daily engine (15pts) ---
+    bp = float(row.get("BREAKOUT_PRESSURE", 50.0))
+    score += 15.0 * np.clip(bp / 100.0, 0.0, 1.0)
+
+    # --- 6. Shape quality (10pts) — lower ShapePriority = better ---
+    sp = float(row.get("ShapePriority", 4.0))
+    score += 10.0 * max(0.0, (7.0 - sp) / 6.0)
+
+    return round(float(np.clip(score, 0.0, 100.0)), 1)
 
 
-def _safe_minmax_normalize(series: pd.Series) -> pd.Series:
-    """Normalize values to [0, 1], handling NaN and constant values safely."""
-    numeric = pd.to_numeric(series, errors="coerce")
-    valid = numeric.dropna()
-    if valid.empty:
-        return pd.Series(np.nan, index=series.index, dtype=float)
-
-    min_val = valid.min()
-    max_val = valid.max()
-    if max_val == min_val:
-        out = pd.Series(1.0, index=series.index, dtype=float)
-        out[numeric.isna()] = np.nan
-        return out
-
-    return (numeric - min_val) / (max_val - min_val)
+def _focus_label(score: float) -> str:
+    """Human-readable urgency label."""
+    if score >= 85:
+        return "🔴 ACT NOW"
+    if score >= 65:
+        return "🟠 HIGH"
+    if score >= 45:
+        return "🟡 MEDIUM"
+    return "⚪ LOW"
 
 
 def rank_hourly_candidates(
     hourly_df: pd.DataFrame,
-    current_price_col: str = "current_price",
+    combined: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Rank hourly candidates using a composite score based on R:R and reward remaining.
-
-    Returns a sorted copy with columns:
-    - rr
-    - reward_from_current_pct
-    - rr_score
+    """
+    Merge daily context into hourly candidates, compute FOCUS_SCORE,
+    and return sorted result.
     """
     if hourly_df is None or hourly_df.empty:
-        return pd.DataFrame(columns=list(getattr(hourly_df, "columns", [])) + ["rr", "reward_from_current_pct", "rr_score"])
+        return pd.DataFrame()
 
     ranked = hourly_df.copy()
 
-    if "entry" not in ranked.columns and "entry_618" in ranked.columns:
-        ranked["entry"] = ranked["entry_618"]
+    # --- Join daily context columns ---
+    daily_cols = ["Ticker", "FINAL_SIGNAL", "BREAKOUT_PRESSURE",
+                  "PERFECT_ENTRY", "INSIGHT_TAGS", "ShapePriority", "Shape"]
+    if combined is not None and not combined.empty:
+        avail = [c for c in daily_cols if c in combined.columns]
+        ranked = ranked.merge(
+            combined[avail].drop_duplicates("Ticker"),
+            on="Ticker", how="left",
+        )
 
-    if "side" not in ranked.columns:
-        ranked["side"] = "long"
+    # Fill defaults for any missing daily columns
+    ranked["FINAL_SIGNAL"]      = ranked.get("FINAL_SIGNAL",      pd.Series(["WATCH"] * len(ranked)))
+    ranked["BREAKOUT_PRESSURE"] = ranked.get("BREAKOUT_PRESSURE", pd.Series([50.0]   * len(ranked)))
+    ranked["ShapePriority"]     = ranked.get("ShapePriority",     pd.Series([4.0]    * len(ranked)))
 
-    if current_price_col != "current_price" and current_price_col in ranked.columns:
-        ranked["current_price"] = ranked[current_price_col]
-    elif "current_price" not in ranked.columns:
-        ranked["current_price"] = np.nan
+    # --- Compute R:R ---
+    def _rr(r):
+        entry = float(r.get("entry_618", np.nan))
+        stop  = float(r.get("stop",      np.nan))
+        tp    = float(r.get("take_profit", np.nan))
+        if any(np.isnan(x) for x in [entry, stop, tp]):
+            return np.nan
+        risk   = entry - stop
+        reward = tp - entry
+        return round(reward / risk, 2) if risk > 0 and reward > 0 else np.nan
 
-    rr_data = ranked.apply(compute_rr_for_row, axis=1, result_type="expand")
-    rr_data.columns = ["rr", "reward_from_current_pct"]
+    ranked["rr"] = ranked.apply(_rr, axis=1)
 
-    ranked["rr"] = rr_data["rr"]
-    ranked["reward_from_current_pct"] = rr_data["reward_from_current_pct"]
+    # --- Compute FOCUS_SCORE ---
+    ranked["FOCUS_SCORE"] = ranked.apply(compute_focus_score, axis=1)
+    ranked["FOCUS"]       = ranked["FOCUS_SCORE"].apply(_focus_label)
 
-    rr_norm = _safe_minmax_normalize(ranked["rr"])
-    reward_norm = _safe_minmax_normalize(ranked["reward_from_current_pct"])
-    ranked["rr_score"] = (0.7 * rr_norm.fillna(0)) + (0.3 * reward_norm.fillna(0))
+    # Sort: entry_618_hit first, then by FOCUS_SCORE descending
+    ranked = ranked.sort_values(
+        by=["entry_618_hit", "FOCUS_SCORE"],
+        ascending=[False, False],
+    ).reset_index(drop=True)
 
-    ranked = ranked.sort_values(by=["rr_score", "rr"], ascending=[False, False]).reset_index(drop=True)
     return ranked
 
 
-# ---------------------------------------------------------
-# Streamlit Page Setup
-# ---------------------------------------------------------
-st.set_page_config(
-    page_title="Momentum Dashboard",
-    layout="wide",
-)
-
+# ==========================================================
+# PAGE SETUP
+# ==========================================================
+st.set_page_config(page_title="Momentum Dashboard", layout="wide")
 st.title("📈 Fib Retracement Dashboard")
 
 st.markdown("""
 ### What this app does
-This dashboard scans **all S&P 500, Hang Seng Index (HSI), and EURO STOXX 50** companies and identifies names that:
+Scans **S&P 500, Hang Seng Index (HSI), and EURO STOXX 50** for names that:
+- recently made a swing high
+- are retracing into **Fibonacci support zones**
+- show signs of **bullish structure, momentum, and rebound strength**
 
-- recently made a swing high  
-- are currently **retracing into Fibonacci support zones**  
-- show signs of **bullish structure, momentum, and rebound strength**  
-- may be presenting **high-probability buying opportunities**
-
-These setups are evaluated using structural signals, retracement depth, momentum confirmation, and pattern behavior.
+Hourly candidates are ranked by **Focus Score** — how actionable the setup is *right now*.
 """)
 
-# Hide Streamlit sidebar toggle by default
-hide_sidebar = """
-<style>
-    button[kind="header"] {display: none !important;}
-</style>
-"""
-st.markdown(hide_sidebar, unsafe_allow_html=True)
+st.markdown("""
+<style>button[kind="header"] {display: none !important;}</style>
+""", unsafe_allow_html=True)
 
-# ---------------------------------------------------------
-# Sidebar Controls
-# ---------------------------------------------------------
+# ==========================================================
+# SIDEBAR
+# ==========================================================
 st.sidebar.header("Settings")
-
-lookback_days = st.sidebar.slider(
-    "Chart lookback (days)",
-    min_value=60,
-    max_value=500,
-    value=180,
-    step=10,
-)
-
+lookback_days = st.sidebar.slider("Chart lookback (days)", 60, 500, 180, 10)
 st.sidebar.write("---")
-st.sidebar.write("Run this after market close / before open.")
+st.sidebar.write("Run after market close / before open.")
+
+# ==========================================================
+# ENGINE RUN (cached)
+# ==========================================================
+ENGINE_VERSION = "2026-02-26-focus-score-v1"   # bump to force cache refresh
 
 
-# -----------------------------
-# Cache Engine Run
-# -----------------------------
-ENGINE_VERSION = "2026-02-21-ui-cleanup-v1"
-
-
-@st.cache_data(show_spinner=True)
+@st.cache_data(show_spinner="Running engine… this takes ~2 minutes on first load.")
 def compute_dashboard(engine_version):
     _ = engine_version
-    (
-        df_all,
-        combined,
-        insight_df,
-        hourly_entries_df,
-        hourly_rejects_df,
-        hourly_df,
-    ) = run_engine()
-    return df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df, hourly_df
+    return run_engine()
 
 
-df_all, combined, insight_df, hourly_entries_df, hourly_rejects_df, hourly_df = compute_dashboard(ENGINE_VERSION)
+(df_all, combined, insight_df,
+ hourly_entries_df, hourly_rejects_df, hourly_df) = compute_dashboard(ENGINE_VERSION)
 
 if combined.empty:
-    st.error("No names in watchlist / combined. Check data or parameters.")
+    st.error("No names in watchlist. Check data or parameters.")
     st.stop()
 
-
-# ---------------------------------------------------------
-# Daily list uses combined output directly to preserve existing ticker selection/ranking.
-# Removed only UI-level filters whose defaults were non-restrictive (0 / unchecked).
-# ---------------------------------------------------------
 df_view = combined.copy()
-
 if df_view.empty:
     st.warning("No tickers match current filters.")
     st.stop()
 
 
-# ---------------------------------------------------------
-# Hourly Entry Candidates (List B)
-# ---------------------------------------------------------
-st.write("### Hourly Entry Candidates (List B)")
+# ==========================================================
+# HOURLY ENTRY CANDIDATES — LIST B
+# ==========================================================
+st.write("---")
+st.write("### ⏱️ Hourly Entry Candidates")
+
+st.markdown("""
+**Focus Score** ranks candidates by actionability right now:
+`🔴 ACT NOW` ≥ 85 · `🟠 HIGH` ≥ 65 · `🟡 MEDIUM` ≥ 45 · `⚪ LOW` < 45
+
+Scoring weights: Entry proximity 30% · Entry-hit bonus +15pts · R:R 25% · Daily signal 20% · Breakout pressure 15% · Shape quality 10%
+""")
 
 if hourly_entries_df is not None and not hourly_entries_df.empty:
-    price_lookup = {}
-    if combined is not None and not combined.empty and {"Ticker", "Latest Price"}.issubset(combined.columns):
-        price_lookup = combined.set_index("Ticker")["Latest Price"].to_dict()
 
-    hourly_rank_input = hourly_entries_df.copy()
-    hourly_rank_input["entry"] = pd.to_numeric(hourly_rank_input.get("entry_618"), errors="coerce")
-    hourly_rank_input["side"] = hourly_rank_input.get("side", "long")
-    hourly_rank_input["current_price"] = hourly_rank_input["Ticker"].map(price_lookup)
-    hourly_rank_input["current_price"] = hourly_rank_input["current_price"].fillna(
-        pd.to_numeric(hourly_rank_input.get("last_close"), errors="coerce")
-    )
+    ranked_hourly = rank_hourly_candidates(hourly_entries_df, combined)
 
-    # readiness removed: ranking now uses R:R only.
-    ranked_hourly = rank_hourly_candidates(hourly_rank_input, current_price_col="current_price")
+    top_n = st.slider("Show top N setups", min_value=5, max_value=50, value=15, step=5)
+    show_top = ranked_hourly.head(top_n).reset_index(drop=True)
 
-    top_n = st.slider("Top hourly setups", min_value=3, max_value=50, value=15, step=1)
+    # Build display table
+    display_cols = {
+        "Ticker":                      "Ticker",
+        "FOCUS":                       "Focus",
+        "FOCUS_SCORE":                 "Score",
+        "FINAL_SIGNAL":                "Daily Signal",
+        "entry_618_hit":               "At Entry?",
+        "entry_618":                   "Entry (61.8%)",
+        "stop":                        "Stop",
+        "take_profit":                 "Target",
+        "rr":                          "R:R",
+        "distance_to_entry_618_pct":   "Dist to Entry",
+        "retrace_from_high_pct":       "Retrace %",
+        "bars_since_high":             "Bars Since High",
+        "BREAKOUT_PRESSURE":           "BP",
+        "INSIGHT_TAGS":                "Tags",
+    }
 
-    hourly_view = ranked_hourly[[
-        "Ticker",
-        "side",
-        "entry",
-        "stop",
-        "take_profit",
-        "rr",
-        "reward_from_current_pct",
-        "DailyRetrLowDate",
-        "DailyRetrLowPrice",
-        "local_high_time",
-        "local_high",
-        "entry_382",
-        "entry_50",
-        "entry_618",
-        "last_close",
-        "retrace_from_high_pct",
-        "bars_since_high",
-        "distance_to_entry_618_pct",
-        "entry_618_hit",
-    ]].head(top_n).copy()
+    avail_cols = {k: v for k, v in display_cols.items() if k in show_top.columns}
+    hourly_view = show_top[list(avail_cols.keys())].rename(columns=avail_cols).copy()
 
-    hourly_view = hourly_view.rename(
-        columns={
-            "DailyRetrLowDate": "Daily Low Date",
-            "DailyRetrLowPrice": "Daily Low",
-            "local_high_time": "Hourly High Time",
-            "local_high": "Hourly High",
-            "entry": "Entry",
-            "entry_382": "Entry 38.2%",
-            "entry_50": "Entry 50%",
-            "entry_618": "Entry 61.8%",
-            "rr": "R:R",
-            "reward_from_current_pct": "Reward Left %",
-            "take_profit": "Take Profit",
-            "last_close": "Last Close",
-            "retrace_from_high_pct": "Retrace % From High",
-            "bars_since_high": "Bars Since High",
-            "distance_to_entry_618_pct": "Distance to 61.8%",
-            "entry_618_hit": "61.8% Hit",
-        }
-    )
+    # Format percentages
+    for col_raw, col_display in [
+        ("distance_to_entry_618_pct", "Dist to Entry"),
+        ("retrace_from_high_pct",     "Retrace %"),
+    ]:
+        if col_display in hourly_view.columns:
+            hourly_view[col_display] = (
+                pd.to_numeric(hourly_view[col_display], errors="coerce") * 100
+            ).round(2).astype(str) + "%"
+
+    # Format R:R
+    if "R:R" in hourly_view.columns:
+        hourly_view["R:R"] = pd.to_numeric(
+            hourly_view["R:R"], errors="coerce"
+        ).round(2)
+
+    # Format At Entry? as Yes/No
+    if "At Entry?" in hourly_view.columns:
+        hourly_view["At Entry?"] = hourly_view["At Entry?"].map(
+            {True: "✅ YES", False: "—", 1: "✅ YES", 0: "—"}
+        ).fillna("—")
 
     hourly_event = st.dataframe(
         hourly_view,
@@ -284,165 +259,150 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
         selection_mode="single-row",
     )
 
+    # --- Row selection ---
     hourly_selected_rows = []
     if hourly_event is not None:
         if hasattr(hourly_event, "selection") and hasattr(hourly_event.selection, "rows"):
             hourly_selected_rows = hourly_event.selection.rows
-        elif hasattr(hourly_event, "rows"):
-            hourly_selected_rows = hourly_event.rows
         elif isinstance(hourly_event, dict):
-            if "selection" in hourly_event and isinstance(hourly_event["selection"], dict):
-                hourly_selected_rows = hourly_event["selection"].get("rows", [])
-            else:
-                hourly_selected_rows = hourly_event.get("rows", [])
+            hourly_selected_rows = (
+                hourly_event.get("selection", {}).get("rows", [])
+            )
 
     if "hourly_selected_ticker" not in st.session_state:
-        st.session_state.hourly_selected_ticker = None
+        st.session_state.hourly_selected_ticker = (
+            show_top.iloc[0]["Ticker"] if not show_top.empty else None
+        )
 
-    hourly_top = ranked_hourly.head(top_n).reset_index(drop=True)
     if hourly_selected_rows:
-        selected_idx = hourly_selected_rows[0]
-        if 0 <= selected_idx < len(hourly_top):
-            st.session_state.hourly_selected_ticker = hourly_top.iloc[selected_idx]["Ticker"]
-
-    if (
-        st.session_state.hourly_selected_ticker is None
-        and not hourly_top.empty
-    ):
-        st.session_state.hourly_selected_ticker = hourly_top.iloc[0]["Ticker"]
+        idx = hourly_selected_rows[0]
+        if 0 <= idx < len(show_top):
+            st.session_state.hourly_selected_ticker = show_top.iloc[idx]["Ticker"]
 
     hourly_ticker_selected = st.session_state.hourly_selected_ticker
 
+    # --- Hourly chart ---
     if hourly_ticker_selected and hourly_df is not None and not hourly_df.empty:
-        selected_hourly_row = ranked_hourly[ranked_hourly["Ticker"] == hourly_ticker_selected]
+        sel_row_df = ranked_hourly[ranked_hourly["Ticker"] == hourly_ticker_selected]
         ticker_hourly = hourly_df[hourly_df["Ticker"] == hourly_ticker_selected].copy()
 
-        if (not selected_hourly_row.empty) and (not ticker_hourly.empty):
-            hrow = selected_hourly_row.iloc[0]
-            ticker_hourly["DateTime"] = pd.to_datetime(ticker_hourly["DateTime"], errors="coerce", utc=True)
-            ticker_hourly["DateTime"] = ticker_hourly["DateTime"].dt.tz_convert(None)
+        if not sel_row_df.empty and not ticker_hourly.empty:
+            hrow = sel_row_df.iloc[0]
+
+            ticker_hourly["DateTime"] = pd.to_datetime(
+                ticker_hourly["DateTime"], errors="coerce", utc=True
+            ).dt.tz_convert(None)
             ticker_hourly = ticker_hourly.dropna(subset=["DateTime"]).sort_values("DateTime")
 
-            retr_low_dt = pd.to_datetime(hrow.get("DailyRetrLowDate"), errors="coerce", utc=True)
-            high_dt = pd.to_datetime(hrow.get("local_high_time"), errors="coerce", utc=True)
-
-            if pd.notna(retr_low_dt):
-                retr_low_dt = retr_low_dt.tz_convert(None)
-            if pd.notna(high_dt):
-                high_dt = high_dt.tz_convert(None)
+            high_dt    = pd.to_datetime(hrow.get("local_high_time"), errors="coerce", utc=True)
+            retr_dt    = pd.to_datetime(hrow.get("DailyRetrLowDate"), errors="coerce", utc=True)
+            if pd.notna(high_dt):  high_dt = high_dt.tz_convert(None)
+            if pd.notna(retr_dt):  retr_dt = retr_dt.tz_convert(None)
 
             max_dt = ticker_hourly["DateTime"].max()
-            context_start = high_dt - pd.Timedelta(hours=72) if pd.notna(high_dt) else max_dt - pd.Timedelta(hours=72)
+            win_start = (high_dt - pd.Timedelta(hours=72)) if pd.notna(high_dt) else (max_dt - pd.Timedelta(hours=72))
+            if pd.notna(retr_dt):
+                win_start = min(retr_dt, win_start)
+            win_end = max_dt
 
-            if pd.notna(retr_low_dt):
-                window_start = min(retr_low_dt, context_start)
-            else:
-                window_start = context_start
-
-            if pd.notna(high_dt):
-                window_end = max(max_dt, high_dt + pd.Timedelta(hours=6))
-            else:
-                window_end = max_dt
-
-            default_window_hourly = ticker_hourly[
-                (ticker_hourly["DateTime"] >= window_start) & (ticker_hourly["DateTime"] <= window_end)
+            visible = ticker_hourly[
+                (ticker_hourly["DateTime"] >= win_start) &
+                (ticker_hourly["DateTime"] <= win_end)
             ]
+            if len(visible) < 50:
+                fallback = ticker_hourly.tail(240)
+                if not fallback.empty:
+                    win_start = fallback["DateTime"].min()
+                    win_end   = fallback["DateTime"].max()
 
-            if len(default_window_hourly) < 50:
-                fallback_window = ticker_hourly.tail(240)
-                if not fallback_window.empty:
-                    window_start = fallback_window["DateTime"].min()
-                    window_end = fallback_window["DateTime"].max()
+            focus_score = hrow.get("FOCUS_SCORE", "—")
+            focus_label = hrow.get("FOCUS", "")
+            daily_sig   = hrow.get("FINAL_SIGNAL", "—")
+            tags        = hrow.get("INSIGHT_TAGS", "")
 
-            fig_hourly = go.Figure(
-                data=[
-                    go.Candlestick(
-                        x=ticker_hourly["DateTime"],
-                        open=ticker_hourly["Open"],
-                        high=ticker_hourly["High"],
-                        low=ticker_hourly["Low"],
-                        close=ticker_hourly["Close"],
-                        name=hourly_ticker_selected,
-                    )
-                ]
+            st.markdown(
+                f"**{hourly_ticker_selected}** &nbsp;|&nbsp; "
+                f"{focus_label} (Score: {focus_score}) &nbsp;|&nbsp; "
+                f"Daily: **{daily_sig}** &nbsp;|&nbsp; {tags}"
             )
 
-            level_specs = [
-                ("entry_382", "Entry 38.2%", "#1f77b4"),
-                ("entry_50", "Entry 50%", "#9467bd"),
-                ("entry_618", "Entry 61.8%", "#ff7f0e"),
-                ("stop", "Stop", "#d62728"),
-                ("take_profit", "Take Profit", "#2ca02c"),
-            ]
+            fig_h = go.Figure(data=[go.Candlestick(
+                x=ticker_hourly["DateTime"],
+                open=ticker_hourly["Open"],
+                high=ticker_hourly["High"],
+                low=ticker_hourly["Low"],
+                close=ticker_hourly["Close"],
+                name=hourly_ticker_selected,
+            )])
 
-            for col, label, color in level_specs:
-                if col in hrow and pd.notna(hrow[col]):
-                    fig_hourly.add_hline(
-                        y=float(hrow[col]),
+            for col, label, color in [
+                ("entry_382",   "Entry 38.2%", "#1f77b4"),
+                ("entry_50",    "Entry 50%",   "#9467bd"),
+                ("entry_618",   "Entry 61.8%", "#ff7f0e"),
+                ("stop",        "Stop",        "#d62728"),
+                ("take_profit", "Target",      "#2ca02c"),
+            ]:
+                val = hrow.get(col)
+                if val is not None and pd.notna(val):
+                    fig_h.add_hline(
+                        y=float(val),
                         line_dash="dash",
                         line_color=color,
                         annotation_text=label,
                         annotation_position="top left",
                     )
 
-            fig_hourly.update_layout(
-                title=f"{hourly_ticker_selected} – Hourly (List B)",
-                xaxis_title="DateTime",
-                yaxis_title="Price",
+            fig_h.update_layout(
+                title=f"{hourly_ticker_selected} — Hourly",
+                xaxis_title="DateTime", yaxis_title="Price",
                 xaxis_rangeslider_visible=False,
-                template="plotly_white",
-                height=500,
+                template="plotly_white", height=480,
             )
-            fig_hourly.update_xaxes(range=[window_start, window_end])
+            fig_h.update_xaxes(range=[win_start, win_end])
 
-            visible_hourly = ticker_hourly[
-                (ticker_hourly["DateTime"] >= window_start) & (ticker_hourly["DateTime"] <= window_end)
+            vis2 = ticker_hourly[
+                (ticker_hourly["DateTime"] >= win_start) &
+                (ticker_hourly["DateTime"] <= win_end)
             ]
-            if not visible_hourly.empty:
-                y_low = pd.to_numeric(visible_hourly["Low"], errors="coerce").min()
-                y_high = pd.to_numeric(visible_hourly["High"], errors="coerce").max()
-                if pd.notna(y_low) and pd.notna(y_high):
-                    y_span = y_high - y_low
-                    y_padding = max(y_span * 0.08, y_high * 0.002)
-                    fig_hourly.update_yaxes(range=[y_low - y_padding, y_high + y_padding])
+            if not vis2.empty:
+                y_lo = pd.to_numeric(vis2["Low"],  errors="coerce").min()
+                y_hi = pd.to_numeric(vis2["High"], errors="coerce").max()
+                if pd.notna(y_lo) and pd.notna(y_hi):
+                    pad = max((y_hi - y_lo) * 0.08, y_hi * 0.002)
+                    fig_h.update_yaxes(range=[y_lo - pad, y_hi + pad])
 
-            st.plotly_chart(fig_hourly, use_container_width=True)
+            st.plotly_chart(fig_h, use_container_width=True)
+
 else:
     st.info("No hourly entry candidates found for current run.")
 
 
-# ---------------------------------------------------------
-# Summary Metrics
-# ---------------------------------------------------------
+# ==========================================================
+# SUMMARY METRICS
+# ==========================================================
+st.write("---")
 col1, col2, col3, col4 = st.columns(4)
 with col1:
-    st.metric("Tickers (filtered)", len(df_view))
+    st.metric("Tickers scanned", len(df_view))
 with col2:
-    st.metric("BUY signals", (df_view["FINAL_SIGNAL"] == "BUY").sum())
+    st.metric("BUY signals", int((df_view["FINAL_SIGNAL"] == "BUY").sum()))
 with col3:
-    st.metric("WATCH signals", (df_view["FINAL_SIGNAL"] == "WATCH").sum())
+    st.metric("WATCH signals", int((df_view["FINAL_SIGNAL"] == "WATCH").sum()))
 with col4:
-    st.metric("Avg Breakout Pressure", f"{pd.to_numeric(df_view.get('BREAKOUT_PRESSURE'), errors='coerce').mean():.1f}")
+    bp_mean = pd.to_numeric(df_view.get("BREAKOUT_PRESSURE"), errors="coerce").mean()
+    st.metric("Avg Breakout Pressure", f"{bp_mean:.1f}")
 
 
-# ---------------------------------------------------------
-# Ranked Dashboard — Row-click selection using st.dataframe
-# ---------------------------------------------------------
-st.write("### Ranked Dashboard (Filtered)")
+# ==========================================================
+# RANKED DAILY DASHBOARD
+# ==========================================================
+st.write("### 📋 Ranked Daily Dashboard")
 
-ranked_table = df_view[
-    [
-        "Ticker",
-        "SwingHigh",
-        "SwingLow",
-        "Latest Price",
-    ]
-].reset_index(drop=True)
-
-swing_range = (ranked_table["SwingHigh"] - ranked_table["SwingLow"]).replace(0, pd.NA)
-ranked_table["Current Retracement %"] = (
-    (ranked_table["SwingHigh"] - ranked_table["Latest Price"]) / swing_range
-) * 100
+ranked_table = df_view[["Ticker", "SwingHigh", "SwingLow", "Latest Price"]].copy()
+swing_range  = (ranked_table["SwingHigh"] - ranked_table["SwingLow"]).replace(0, pd.NA)
+ranked_table["Retracement %"] = (
+    (ranked_table["SwingHigh"] - ranked_table["Latest Price"]) / swing_range * 100
+).round(1)
 ranked_table = ranked_table.drop(columns=["Latest Price"])
 
 event = st.dataframe(
@@ -454,183 +414,115 @@ event = st.dataframe(
     selection_mode="single-row",
 )
 
-# Handle selection for newer/older Streamlit selection payloads
 selected_rows = []
 if event is not None:
     if hasattr(event, "selection") and hasattr(event.selection, "rows"):
         selected_rows = event.selection.rows
-    elif hasattr(event, "rows"):
-        selected_rows = event.rows
     elif isinstance(event, dict):
-        if "selection" in event and isinstance(event["selection"], dict):
-            selected_rows = event["selection"].get("rows", [])
-        else:
-            selected_rows = event.get("rows", [])
+        selected_rows = event.get("selection", {}).get("rows", [])
 
 if "selected_ticker" not in st.session_state:
     st.session_state.selected_ticker = None
 
 if selected_rows:
-    # DataframeSelectionState.rows are integer positions in the original df
-    selected_idx = selected_rows[0]
-    if 0 <= selected_idx < len(ranked_table):
-        st.session_state.selected_ticker = ranked_table.iloc[selected_idx]["Ticker"]
+    idx = selected_rows[0]
+    if 0 <= idx < len(ranked_table):
+        st.session_state.selected_ticker = ranked_table.iloc[idx]["Ticker"]
 
 ticker_selected = st.session_state.selected_ticker
 
 
-# ---------------------------------------------------------
-# Enhanced Chart Function (combined: price + MACD + RSI)
-# ---------------------------------------------------------
+# ==========================================================
+# CHART FUNCTION
+# ==========================================================
 def plot_ticker_chart(df_all, row, lookback_days=180):
-    import numpy as np  # noqa: F401
-
     ticker = row["Ticker"]
-
-    # 1. Load full history & compute indicators
     df_full = df_all[df_all["Ticker"] == ticker].sort_values("Date").copy()
     if df_full.empty:
         st.write("No price data found.")
         return
 
-    # Moving averages
-    df_full["SMA10"] = df_full["Close"].rolling(10).mean()
-    df_full["EMA20"] = df_full["Close"].ewm(span=20).mean()
-    df_full["EMA50"] = df_full["Close"].ewm(span=50).mean()
+    df_full["SMA10"]   = df_full["Close"].rolling(10).mean()
+    df_full["EMA20"]   = df_full["Close"].ewm(span=20).mean()
+    df_full["EMA50"]   = df_full["Close"].ewm(span=50).mean()
+    df_full["EMA12"]   = df_full["Close"].ewm(span=12).mean()
+    df_full["EMA26"]   = df_full["Close"].ewm(span=26).mean()
+    df_full["MACD"]    = df_full["EMA12"] - df_full["EMA26"]
+    df_full["Signal"]  = df_full["MACD"].ewm(span=9).mean()
+    df_full["MACDH"]   = df_full["MACD"] - df_full["Signal"]
 
-    # MACD
-    df_full["EMA12"] = df_full["Close"].ewm(span=12).mean()
-    df_full["EMA26"] = df_full["Close"].ewm(span=26).mean()
-    df_full["MACD"] = df_full["EMA12"] - df_full["EMA26"]
-    df_full["Signal"] = df_full["MACD"].ewm(span=9).mean()
-    df_full["MACDH"] = df_full["MACD"] - df_full["Signal"]
+    delta    = df_full["Close"].diff()
+    avg_gain = delta.clip(lower=0).rolling(14).mean()
+    avg_loss = (-delta.clip(upper=0)).rolling(14).mean()
+    df_full["RSI"] = 100 - (100 / (1 + avg_gain / avg_loss))
 
-    # RSI
-    delta = df_full["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-    rs = avg_gain / avg_loss
-    df_full["RSI"] = 100 - (100 / (1 + rs))
-
-    # Slice for display
-    df_t = df_full.tail(lookback_days).copy()
+    df_t  = df_full.tail(lookback_days).copy()
     dates = df_t["Date"]
 
     fig = make_subplots(
-        rows=3,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.03,
-        row_heights=[0.6, 0.2, 0.2],
+        rows=3, cols=1, shared_xaxes=True,
+        vertical_spacing=0.03, row_heights=[0.6, 0.2, 0.2],
     )
 
-    # Price + MAs
-    fig.add_trace(
-        go.Candlestick(
-            x=dates,
-            open=df_t["Open"],
-            high=df_t["High"],
-            low=df_t["Low"],
-            close=df_t["Close"],
-            name=ticker,
-        ),
-        row=1,
-        col=1,
-    )
-    fig.add_trace(go.Scatter(x=dates, y=df_t["SMA10"], name="SMA10"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=dates, y=df_t["EMA20"], name="EMA20"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=dates, y=df_t["EMA50"], name="EMA50"), row=1, col=1)
+    fig.add_trace(go.Candlestick(
+        x=dates, open=df_t["Open"], high=df_t["High"],
+        low=df_t["Low"], close=df_t["Close"], name=ticker,
+    ), row=1, col=1)
 
-    swing_low = row["SwingLow"]
-    swing_high = row["SwingHigh"]
+    for ma, color in [("SMA10", "orange"), ("EMA20", "cyan"), ("EMA50", "magenta")]:
+        fig.add_trace(go.Scatter(x=dates, y=df_t[ma], name=ma,
+                                  line=dict(color=color, width=1)), row=1, col=1)
 
+    swing_low  = row.get("SwingLow")
+    swing_high = row.get("SwingHigh")
     if pd.notna(swing_low) and pd.notna(swing_high):
         swing = swing_high - swing_low
-        fib_levels = {
-            "100%": swing_high,
-            "78.6%": swing_high - 0.786 * swing,
-            "61.8%": swing_high - 0.618 * swing,
-            "50%": swing_high - 0.500 * swing,
-            "38.2%": swing_high - 0.382 * swing,
-            "0%": swing_low,
-        }
+        x0, x1 = dates.iloc[0], dates.iloc[-1]
+        for label, level in [
+            ("100%", swing_high),
+            ("78.6%", swing_high - 0.786 * swing),
+            ("61.8%", swing_high - 0.618 * swing),
+            ("50%",   swing_high - 0.500 * swing),
+            ("38.2%", swing_high - 0.382 * swing),
+            ("0%",    swing_low),
+        ]:
+            fig.add_shape(type="line", x0=x0, x1=x1, y0=level, y1=level,
+                          line=dict(color="green", width=1, dash="dot"), row=1, col=1)
+            fig.add_annotation(x=x1, y=level, text=label, showarrow=False,
+                                xanchor="left", font=dict(size=10, color="green"),
+                                row=1, col=1)
 
-        x0 = dates.iloc[0]
-        x1 = dates.iloc[-1]
-
-        for label, level in fib_levels.items():
-            fig.add_shape(
-                type="line",
-                x0=x0,
-                x1=x1,
-                y0=level,
-                y1=level,
-                line=dict(color="green", width=1, dash="dot"),
-                row=1,
-                col=1,
-            )
-            fig.add_annotation(
-                x=x1,
-                y=level,
-                text=label,
-                showarrow=False,
-                xanchor="left",
-                yanchor="middle",
-                font=dict(size=10, color="green"),
-                row=1,
-                col=1,
-            )
-
-    # MACD
     fig.add_hline(y=0, line=dict(color="white", width=1), row=2, col=1)
-    fig.add_trace(
-        go.Bar(
-            x=dates,
-            y=df_t["MACDH"],
-            marker_color=df_t["MACDH"].apply(
-                lambda v: "green" if v >= 0 else "red"
-            ),
-            opacity=0.45,
-            name="MACDH",
-        ),
-        row=2,
-        col=1,
-    )
-    fig.add_trace(go.Scatter(x=dates, y=df_t["MACD"], name="MACD"), row=2, col=1)
-    fig.add_trace(
-        go.Scatter(x=dates, y=df_t["Signal"], name="Signal"), row=2, col=1
-    )
+    fig.add_trace(go.Bar(
+        x=dates, y=df_t["MACDH"],
+        marker_color=df_t["MACDH"].apply(lambda v: "green" if v >= 0 else "red"),
+        opacity=0.45, name="MACDH",
+    ), row=2, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=df_t["MACD"],   name="MACD"),   row=2, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=df_t["Signal"], name="Signal"), row=2, col=1)
 
-    # RSI
     fig.add_trace(go.Scatter(x=dates, y=df_t["RSI"], name="RSI"), row=3, col=1)
-    fig.add_hline(y=70, line=dict(color="red", dash="dot"), row=3, col=1)
+    fig.add_hline(y=70, line=dict(color="red",   dash="dot"), row=3, col=1)
     fig.add_hline(y=30, line=dict(color="green", dash="dot"), row=3, col=1)
 
     fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="MACD", row=2, col=1)
-    fig.update_yaxes(title_text="RSI", row=3, col=1, range=[0, 100])
-
-    fig.update_layout(
-        height=760,
-        showlegend=False,
-        margin=dict(l=0, r=0, t=20, b=20),
-        xaxis_rangeslider_visible=False,
-    )
-
+    fig.update_yaxes(title_text="MACD",  row=2, col=1)
+    fig.update_yaxes(title_text="RSI",   row=3, col=1, range=[0, 100])
+    fig.update_layout(height=760, showlegend=False,
+                      margin=dict(l=0, r=0, t=20, b=20),
+                      xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
 
 
-# ---------------------------------------------------------
-# Enhanced Trading Summary Card
-# ---------------------------------------------------------
-def format_section(summary_text, start, end):
+# ==========================================================
+# TRADING SUMMARY CARD
+# ==========================================================
+def format_section(text, start, end):
     try:
-        section = summary_text.split(start, 1)[1]
+        section = text.split(start, 1)[1]
         if end:
             section = section.split(end, 1)[0]
-        lines = [f"• {line.strip()}" for line in section.split("\n") if line.strip()]
+        lines = [f"• {l.strip()}" for l in section.split("\n") if l.strip()]
         return "<br>".join(lines)
     except Exception:
         return "N/A"
@@ -638,128 +530,122 @@ def format_section(summary_text, start, end):
 
 def render_summary_card(row, hourly_row=None):
     summary = generate_trading_summary(row)
-
     st.markdown("### 📘 Trading Summary")
 
-    hourly_plan_html = ""
+    hourly_html = ""
     if hourly_row is not None and not hourly_row.empty:
         hr = hourly_row.iloc[0]
-        entry_val = pd.to_numeric(pd.Series([hr.get("entry", hr.get("entry_618", np.nan))]), errors="coerce").iloc[0]
-        stop_val = pd.to_numeric(pd.Series([hr.get("stop", np.nan)]), errors="coerce").iloc[0]
-        tp_val = pd.to_numeric(pd.Series([hr.get("take_profit", np.nan)]), errors="coerce").iloc[0]
-        pullback_val = pd.to_numeric(pd.Series([hr.get("pullback_pct", hr.get("retrace_from_high_pct", np.nan))]), errors="coerce").iloc[0]
-        dist_val = pd.to_numeric(pd.Series([hr.get("distance_to_entry_pct", hr.get("distance_to_entry_618_pct", np.nan))]), errors="coerce").iloc[0]
-        hit_val = hr.get("entry_hit", hr.get("entry_618_hit", False))
+        entry_v   = float(hr.get("entry_618",              np.nan))
+        stop_v    = float(hr.get("stop",                   np.nan))
+        tp_v      = float(hr.get("take_profit",            np.nan))
+        pb_v      = float(hr.get("retrace_from_high_pct",  np.nan))
+        dist_v    = float(hr.get("distance_to_entry_618_pct", np.nan))
+        hit_v     = bool(hr.get("entry_618_hit", False))
+        rr_v      = float(hr.get("rr", np.nan))
+        focus_v   = hr.get("FOCUS_SCORE", "—")
+        focus_l   = hr.get("FOCUS", "")
 
-        hourly_plan_html = f"""
-<h3 style=\"color:#4CC9F0; margin-bottom:5px;\">⏱️ Hourly Entry Plan</h3>
-<b>Entry:</b> {entry_val:.4f}<br>
-<b>Stop:</b> {stop_val:.4f}<br>
-<b>Take Profit:</b> {tp_val:.4f}<br>
-<b>Pullback:</b> {pullback_val*100:.2f}%<br>
-<b>Distance to Entry:</b> {dist_val*100:.2f}%<br>
-<b>Entry Hit:</b> {bool(hit_val)}<br><br>
+        hourly_html = f"""
+<h3 style="color:#4CC9F0; margin-bottom:5px;">⏱️ Hourly Entry Plan</h3>
+<b>Focus:</b> {focus_l} ({focus_v})<br>
+<b>Entry (61.8%):</b> {entry_v:.4f} &nbsp; {'<span style="color:lime">✅ AT ENTRY NOW</span>' if hit_v else ''}<br>
+<b>Stop:</b> {stop_v:.4f}<br>
+<b>Target:</b> {tp_v:.4f}<br>
+<b>R:R:</b> {rr_v:.2f if not np.isnan(rr_v) else "N/A"}<br>
+<b>Pullback from high:</b> {pb_v*100:.2f}%<br>
+<b>Distance to entry:</b> {dist_v*100:.2f}%<br><br>
 """
 
     html = f"""
-<div style="background-color:#f8f9fa;padding:20px;border-radius:10px;border:1px solid #ddd; font-size:15px;">
+<div style="background:#f8f9fa;padding:20px;border-radius:10px;
+            border:1px solid #ddd;font-size:15px;">
 
-<h3 style="color:#4CC9F0; margin-bottom:5px;">🎯 Overview</h3>
+<h3 style="color:#4CC9F0;margin-bottom:5px;">🎯 Overview</h3>
 <b>Ticker:</b> {row['Ticker']}<br>
 <b>Signal:</b> {row['FINAL_SIGNAL']}<br>
-<b>Shape:</b> {row['Shape']}<br>
-<b>Insights:</b> {row['INSIGHT_TAGS']}<br>
-<b>Next Action:</b> {row['NEXT_ACTION']}<br><br>
+<b>Shape:</b> {row.get('Shape','—')}<br>
+<b>Insights:</b> {row.get('INSIGHT_TAGS','—')}<br>
+<b>Next Action:</b> {row.get('NEXT_ACTION','—')}<br><br>
 
-<h3 style="color:#4CC9F0; margin-bottom:5px;">📈 Interpretation</h3>
+<h3 style="color:#4CC9F0;margin-bottom:5px;">📈 Interpretation</h3>
 {format_section(summary, "Interpretation:", "Your Trading Plan")}
-
 <br>
 
-<h3 style="color:#4CC9F0; margin-bottom:5px;">📝 Trade Plan</h3>
+<h3 style="color:#4CC9F0;margin-bottom:5px;">📝 Trade Plan</h3>
 {format_section(summary, "Primary Entry:", "No-Trade Conditions:")}
-
 <br>
 
-<h3 style="color:#F72585; margin-bottom:5px;">⚠️ Risk Conditions</h3>
+<h3 style="color:#F72585;margin-bottom:5px;">⚠️ Risk Conditions</h3>
 {format_section(summary, "No-Trade Conditions:", None)}
-
 <br>
-{hourly_plan_html}
-
+{hourly_html}
 </div>
 """
     st.markdown(html, unsafe_allow_html=True)
 
 
-# ---------------------------------------------------------
-# Ticker Drilldown
-# ---------------------------------------------------------
+# ==========================================================
+# TICKER DRILLDOWN
+# ==========================================================
 if ticker_selected:
-    selected_rows_df = df_view[df_view["Ticker"] == ticker_selected]
-    if selected_rows_df.empty:
+    sel_df = df_view[df_view["Ticker"] == ticker_selected]
+    if sel_df.empty:
         st.warning("Selected ticker no longer available.")
         st.stop()
-    row_sel = selected_rows_df.iloc[0]
+    row_sel = sel_df.iloc[0]
 
-    st.write(f"### 📌 Selected: **{ticker_selected}**")
-
-    colA, colB, colC, colD = st.columns(4)
-    with colA:
-        st.metric("Signal", row_sel["FINAL_SIGNAL"])
-    with colB:
-        st.metric("Shape", row_sel.get("Shape", "N/A"))
-    with colC:
-        st.metric("Breakout Pressure", f"{row_sel['BREAKOUT_PRESSURE']:.2f}")
-    with colD:
-        st.metric(
-            "Perfect Entry",
-            f"{row_sel['PERFECT_ENTRY']:.2f}"
-            if pd.notna(row_sel["PERFECT_ENTRY"])
-            else "N/A",
-        )
+    st.write(f"### 📌 {ticker_selected}")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: st.metric("Signal",   row_sel["FINAL_SIGNAL"])
+    with c2: st.metric("Shape",    row_sel.get("Shape", "—"))
+    with c3: st.metric("Breakout Pressure", f"{row_sel.get('BREAKOUT_PRESSURE', 0):.1f}")
+    with c4:
+        pe = row_sel.get("PERFECT_ENTRY")
+        st.metric("Perfect Entry", f"{pe:.1f}" if pd.notna(pe) else "N/A")
 
     plot_ticker_chart(df_all, row_sel, lookback_days=lookback_days)
-    hourly_sel = hourly_entries_df[hourly_entries_df["Ticker"] == ticker_selected] if hourly_entries_df is not None and not hourly_entries_df.empty else None
+
+    hourly_sel = None
+    if hourly_entries_df is not None and not hourly_entries_df.empty:
+        # Use ranked version so FOCUS_SCORE is available
+        try:
+            hourly_sel = ranked_hourly[ranked_hourly["Ticker"] == ticker_selected]
+            if hourly_sel.empty:
+                hourly_sel = None
+        except NameError:
+            hourly_sel = None
+
     render_summary_card(row_sel, hourly_row=hourly_sel)
 else:
-    st.info("Click a row in the table to display charts and trading summary.")
+    st.info("Click a row in the table above to see charts and trading summary.")
 
 
+# ==========================================================
+# LEGEND
+# ==========================================================
 st.write("---")
-st.subheader("📘 Indicator Explanations")
-
+st.subheader("📘 How to read this dashboard")
 st.markdown("""
-### **Insight Tags**
-These are quick-glance labels that highlight strong structural or momentum characteristics:
-- **🔥 PRIME** – very clean structure, very close to turning into a BUY  
-- **⚡ BOS_IMMINENT** – price is sitting just below the breakout level  
-- **💥 MACD_THRUST** – strong momentum expansion  
-- **📉 SQUEEZE** – tight volatility coil, likely to explode  
-- **🔋 ENERGY_BUILDUP** – rising energy with a narrowing range  
-- **🎯 PERFECT_ENTRY** – exceptionally clean retracement & higher low  
-- *and others…*
+### Focus Score (Hourly)
+Ranks candidates by **how actionable they are right now**. Factors:
+- **Entry proximity (30%)** — how close price is to the 61.8% Fibonacci entry
+- **Entry hit bonus (+15pts)** — price is *at* the zone right now → act immediately
+- **R:R (25%)** — reward vs risk, capped at 5:1
+- **Daily signal (20%)** — BUY from daily engine scores higher than WATCH
+- **Breakout pressure (15%)** — structural energy built up on the daily chart
+- **Shape quality (10%)** — cleaner structure (consolidation, rounded) scores higher
 
 ---
-
-### **Ranking Note**
-Hourly candidates are ranked by actionable **Risk:Reward (R:R)** and remaining reward from the current price.
-
----
-
-### **Breakout Pressure**
-Measures the “energy” pushing price upward:
-- closeness to BOS  
-- higher-low strength  
-- MACD / RSI thrust  
-- volatility compression  
-
-Higher = stronger probability of breakout continuation.
+### Insight Tags
+- **🔥 PRIME** — clean structure, very close to BUY
+- **⚡ BOS_IMMINENT** — price just below breakout level
+- **💥 MACD_THRUST** — momentum expanding
+- **📉 SQUEEZE** — volatility coil, likely to break fast
+- **🔋 ENERGY_BUILDUP** — rising energy, narrowing range
+- **🎯 PERFECT_ENTRY** — clean retracement and higher low
 
 ---
-
-### **Perfect Entry Score**
-Evaluates the **quality of the retracement**, **cleanliness of the higher low**, **shape geometry**, and **proximity to BOS**.
-
-Score > 80 normally signals an institution-grade entry structure.
+### Breakout Pressure
+Measures structural energy: BOS proximity + higher-low strength + MACD/RSI thrust + compression.
+Higher = stronger probability of upside continuation.
 """)
