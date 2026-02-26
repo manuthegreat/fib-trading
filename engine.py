@@ -22,8 +22,22 @@ BOUNCE_TOL = 0.01
 # =========================================================
 def find_swing_as_of_quick(group, current_date, lookback_days=LOOKBACK_DAYS):
     """
-    Swing high based on HIGH prices.
-    Swing low based on LOW prices.
+    Identifies the most recent meaningful swing high/low pair for Fibonacci analysis.
+
+    SWING HIGH: the highest pivot high within LOOKBACK_DAYS of current_date.
+
+    SWING LOW: the minimum Low price BETWEEN the most recent prior pivot high
+               and the current swing high. This ensures the swing low belongs
+               to the same impulse wave as the swing high, not an earlier wave.
+
+    Example (7625.HK):
+      Prior pivot high: Feb 2025 spike (~11.5)
+      Current swing high: Jun 2025 (10.68)
+      Correct swing low: trough between Feb–Jun 2025 (~7.85)  ← this fix
+      Old (wrong) result: Aug 2024 absolute low (6.00) — different wave entirely
+
+    Fallback: if no prior pivot high exists before the current swing high,
+              falls back to min(Low) in the PRE_HIGH_LOOKBACK window (original behavior).
     """
 
     window = group[
@@ -35,51 +49,116 @@ def find_swing_as_of_quick(group, current_date, lookback_days=LOOKBACK_DAYS):
         return None
 
     highs = window["High"].values
-    lows = window["Low"].values
+    lows  = window["Low"].values
     dates = window["Date"].values
 
     look = 5
-    pivots = []
+    pivot_indices = []
 
-    # Find local maxima using HIGH
+    # Find all local pivot highs using HIGH prices
     for i in range(look, len(highs) - look):
         if highs[i] == max(highs[i - look : i + look + 1]):
-            pivots.append(i)
+            pivot_indices.append(i)
 
-    if not pivots:
+    if not pivot_indices:
         return None
 
-    # Most prominent swing high (highest high)
-    best_rel_idx = max(pivots, key=lambda idx: highs[idx])
+    # Current swing high = highest of all pivots
+    best_rel_idx    = max(pivot_indices, key=lambda idx: highs[idx])
     swing_high_price = float(highs[best_rel_idx])
-    swing_high_date = pd.to_datetime(dates[best_rel_idx])
+    swing_high_date  = pd.to_datetime(dates[best_rel_idx])
 
-    # Find swing low BEFORE that pivot based on LOW
+    # ------------------------------------------------------------------
+    # SWING LOW: anchor the low to the current wave, not an earlier one.
+    #
+    # Algorithm:
+    #   1. Find the candidate low = min Low in PRE_HIGH_LOOKBACK window
+    #      before the swing high (same as original behaviour).
+    #   2. Check if there is a pivot high BETWEEN the candidate low date
+    #      and the current swing high date that is HIGHER than the
+    #      candidate low (i.e. a real intervening higher high).
+    #   3. Only if such an intervening high exists → the candidate low
+    #      belongs to an earlier wave. Re-anchor: swing low = min Low
+    #      AFTER that intervening high (and before the current swing high).
+    #   4. If no intervening higher high → keep the candidate low as-is.
+    #      (original behaviour preserved exactly)
+    #
+    # Example (7625.HK):
+    #   Candidate low : 6.00  (Aug 2024)
+    #   Intervening HH: ~11.5 (Feb 2025 spike)  ← exists → re-anchor
+    #   Corrected low : ~7.85 (trough after Feb 2025 spike) ✓
+    #
+    #   Counter-example (stock making first-ever high, no prior HH):
+    #   Candidate low : absolute trough (correct as-is, no re-anchor)
+    # ------------------------------------------------------------------
+
     pre_high_start = swing_high_date - pd.Timedelta(days=PRE_HIGH_LOOKBACK)
-    pre_high = group[
-        (group["Date"] <= swing_high_date) &
-        (group["Date"] >= pre_high_start)
+    pre_high_segment = group[
+        (group["Date"] >= pre_high_start) &
+        (group["Date"] <= swing_high_date)
     ]
-    
-    if pre_high.empty:
+
+    if pre_high_segment.empty:
         return None
-    
-    low_idx = pre_high["Low"].idxmin()
+
+    # Step 1: candidate low in the full pre-high window
+    candidate_low_idx   = pre_high_segment["Low"].idxmin()
+    candidate_low_date  = pd.to_datetime(group.loc[candidate_low_idx, "Date"])
+
+    # Step 2: look for an intervening higher high between candidate low
+    # and current swing high
+    between_highs = group[
+        (group["Date"] > candidate_low_date) &
+        (group["Date"] < swing_high_date)
+    ]
+
+    intervening_hh_date = None
+    if not between_highs.empty:
+        # Find pivot highs in this segment (5-bar pivot)
+        bh_highs = between_highs["High"].values
+        bh_dates = between_highs["Date"].values
+        lk = min(5, (len(bh_highs) - 1) // 2)  # shrink look if segment is short
+
+        for i in range(lk, len(bh_highs) - lk):
+            if bh_highs[i] == max(bh_highs[max(0, i - lk): i + lk + 1]):
+                # This is a pivot high — and it's necessarily above the
+                # candidate low (since candidate low is a price minimum),
+                # so it qualifies as an intervening higher high
+                intervening_hh_date = pd.to_datetime(bh_dates[i])
+                # Use the MOST RECENT such pivot (closest to current high)
+                # so keep iterating to find the last one
+
+    # Step 3: re-anchor if an intervening HH was found
+    if intervening_hh_date is not None:
+        after_hh = group[
+            (group["Date"] > intervening_hh_date) &
+            (group["Date"] <= swing_high_date)
+        ]
+        between_segment = after_hh if not after_hh.empty else pre_high_segment
+    else:
+        # Step 4: no intervening HH — use original candidate (no change)
+        between_segment = pre_high_segment
+
+    if between_segment.empty:
+        return None
+
+    low_idx         = between_segment["Low"].idxmin()
     swing_low_price = float(group.loc[low_idx, "Low"])
     swing_low_date  = pd.to_datetime(group.loc[low_idx, "Date"])
+
     if swing_low_price >= swing_high_price:
         return None
 
     swing_range = swing_high_price - swing_low_price
 
     return {
-        "Swing Low Date": swing_low_date,
-        "Swing Low Price": swing_low_price,
-        "Swing High Date": swing_high_date,
-        "Swing High Price": swing_high_price,
-        "Retrace 50": swing_high_price - 0.50 * swing_range,
-        "Retrace 61": swing_high_price - 0.618 * swing_range,
-        "Stop Consider (78.6%)": swing_high_price - 0.786 * swing_range,
+        "Swing Low Date":          swing_low_date,
+        "Swing Low Price":         swing_low_price,
+        "Swing High Date":         swing_high_date,
+        "Swing High Price":        swing_high_price,
+        "Retrace 50":              swing_high_price - 0.50  * swing_range,
+        "Retrace 61":              swing_high_price - 0.618 * swing_range,
+        "Stop Consider (78.6%)":   swing_high_price - 0.786 * swing_range,
     }
 
 
@@ -789,30 +868,20 @@ def shape_priority(shape):
 # NEXT ACTION
 # =========================================================
 def next_action(row):
-    """
-    Compact one-line trading instruction.
-    BUY → "Limit: X"
-    WATCH → "Trigger > X | Invalidate < Y"
-    INVALID → "Not actionable"
-    """
     bos = row["LastLocalHigh"]
     hl = row["HL Price"]
 
-    # ---------- BUY ----------
     if row["FINAL_SIGNAL"] == "BUY":
-        # Preferred entry = retest of BOS
         if not np.isnan(bos):
             return f"Limit: {bos:.2f}"
         else:
             return "Limit: N/A"
 
-    # ---------- WATCH ----------
     if row["FINAL_SIGNAL"] == "WATCH":
         trigger = f"Trigger > {bos:.2f}" if not np.isnan(bos) else "Trigger > N/A"
         inval = f"Invalidate < {hl:.2f}" if row["HL Formed"] else "Invalidate < N/A"
         return f"{trigger} | {inval}"
 
-    # ---------- INVALID ----------
     return "Not actionable"
 
 
@@ -843,11 +912,6 @@ def compute_buy_quality(row):
 # 10. PERFECT ENTRY, ENTRY BIAS & BREAKOUT PRESSURE
 # =========================================================
 def compute_perfect_entry(row):
-    """
-    Perfect Entry = clean fib retracement + valid HL + structure intact.
-    BUY setups get a small bonus if they are fully confirmed.
-    """
-
     price = row["Latest Price"]
     low = row["SwingLow"]
     high = row["SwingHigh"]
@@ -860,46 +924,32 @@ def compute_perfect_entry(row):
     if swing <= 0:
         return None
 
-    # ============================================
-    # 1. RETRACEMENT QUALITY (core of PE)
-    # ============================================
-    retr = (high - hl) / swing  # HL relative position between low & high
-    ideal = 0.56                # target ~56% depth
+    retr = (high - hl) / swing
+    ideal = 0.56
     dist = abs(retr - ideal)
 
-    # hard reject if HL is in low-quality region
     if retr < 0.38 or retr > 0.78:
         base_score = 60
     else:
         if dist < 0.05:
-            retr_score = 40        # excellent
+            retr_score = 40
         elif dist < 0.10:
-            retr_score = 30        # good
+            retr_score = 30
         else:
-            retr_score = 15        # acceptable
+            retr_score = 15
 
-        # ============================================
-        # 2. HL confirmation
-        # ============================================
         hl_score = 30 if row["HL Formed"] else 0
 
-        # ============================================
-        # 3. Structure quality (shape)
-        # ============================================
         pr = row.get("ShapePriority", 5)
-
-        if pr == 1:            # consolidation under BOS
+        if pr == 1:
             shape_score = 20
-        elif pr == 2:          # rounded recovery
+        elif pr == 2:
             shape_score = 15
-        elif pr == 3:          # strong recovery
+        elif pr == 3:
             shape_score = 10
         else:
             shape_score = 0
 
-        # ============================================
-        # 4. Proximity to BOS (soft requirement)
-        # ============================================
         bos = row["LastLocalHigh"]
         if not np.isnan(bos):
             dist_bos = (bos - price) / bos
@@ -916,18 +966,13 @@ def compute_perfect_entry(row):
 
     score = base_score
 
-    # ============================================
-    # 5. BONUS FOR FULLY CONFIRMED BUY
-    # ============================================
     if (
         row["FINAL_SIGNAL"] == "BUY"
         and row["Retr Held"]
         and row["Momentum OK"]
     ):
-        # readiness removed: bonus now depends on confirmed BUY structure only.
-        score += 15  # push best BUYs like NCLH into the 90s
+        score += 15
 
-    # cap for INVALID setups
     if row["FINAL_SIGNAL"] == "INVALID":
         score = min(score, 55)
 
@@ -935,12 +980,6 @@ def compute_perfect_entry(row):
 
 
 def compute_entry_bias(row):
-    """
-    Predict whether BUY should be:
-    - RETEST LIKELY
-    - BREAKOUT CONTINUATION LIKELY
-    - NEUTRAL / RANGE
-    """
     if row["FINAL_SIGNAL"] != "BUY":
         return None
 
@@ -950,28 +989,15 @@ def compute_entry_bias(row):
     if np.isnan(bos) or bos == 0:
         return "NEUTRAL"
 
-    # -----------------------------
-    # 1. Price position relative to BOS
-    # -----------------------------
     dist_pct = (price - bos) / bos
-
-    # -----------------------------
-    # 2. Shape bias (tight = retest, steep = breakout)
-    # -----------------------------
     shape = row["Shape"]
 
-    # -----------------------------
-    # 3. Signal logic
-    # -----------------------------
-    # A) Strong continuation behaviour
     if dist_pct > 0.035 and shape in ("strong recovery", "V-reversal"):
         return "BREAKOUT CONTINUATION LIKELY"
 
-    # B) Tight consolidation under BOS → retest usually happens
     if dist_pct < 0.015 and shape in ("consolidation under BOS", "rounded recovery"):
         return "RETEST LIKELY"
 
-    # C) Low noise but no breakout yet → neutral base
     if shape == "normal recovery":
         return "BASE FORMATION"
 
@@ -979,33 +1005,23 @@ def compute_entry_bias(row):
 
 
 def compute_breakout_pressure(row):
-    """
-    Breakout pressure for ALL signals:
-    BUY  → continuation pressure after BOS
-    WATCH → pressure under BOS
-    INVALID → always low but computed
-    """
     price = row["Latest Price"]
     bos = row["LastLocalHigh"]
     hl = row["HL Price"]
 
-    # 1. BOS proximity (for all signals)
     if np.isnan(bos):
         bos_prox = 0
     else:
         raw = 1 - ((bos - price) / max(price, 1e-9))
         bos_prox = np.clip(raw, 0, 1)
 
-    # 2. HL recovery (for all)
     if np.isnan(hl):
         hl_rec = 0
     else:
         hl_rec = np.clip((price - hl) / (0.35 * price), 0, 1)
 
-    # 3. Momentum
     mom = 1 if row["Momentum OK"] else 0
 
-    # 4. Compression (if available)
     g = row.get("__gdata__", None)
     if g is not None and len(g) >= 20:
         atr5 = g["High"].tail(5).max() - g["Low"].tail(5).min()
@@ -1014,7 +1030,6 @@ def compute_breakout_pressure(row):
     else:
         comp = 0
 
-    # BUY → continuation pressure
     if row["FINAL_SIGNAL"] == "BUY" and not np.isnan(bos):
         cont = (price - bos) / (0.02 * bos)
         cont = np.clip(cont, 0, 1)
@@ -1028,7 +1043,7 @@ def compute_breakout_pressure(row):
     )
 
     if row["FINAL_SIGNAL"] == "INVALID":
-        score = min(score, 40.0)   # invalid setups should not show pressure
+        score = min(score, 40.0)
 
     return round(np.clip(score, 0, 100), 2)
 
@@ -1041,61 +1056,37 @@ def generate_insight_tags(row):
     hl = row["HL Price"]
     g = row.get("__gdata__", None)
 
-    # ======================================================
-    # 0 — SAFETY GUARDS
-    # ======================================================
     if g is None or len(g) < 5:
         return ""
 
-    # -----------------------------
-    # Precompute ATR% for volatility-adjusted logic
-    # -----------------------------
     recent = g.tail(20)
     atr = (recent["High"] - recent["Low"]).rolling(5).mean().iloc[-1]
     atr_pct = atr / max(price, 1e-9)
 
-    # ======================================================
-    # 1 — PRIME WATCH
-    # ======================================================
     if (
         row["FINAL_SIGNAL"] == "WATCH"
         and row["BREAKOUT_PRESSURE"] >= 75
         and row["ShapePriority"] <= 2
     ):
-        # readiness removed: PRIME now uses pressure + structure quality.
         tags.append("🔥 PRIME")
 
-    # ======================================================
-    # 2 — BOS IMMINENT (volatility-aware)
-    # ======================================================
     if not np.isnan(bos):
         dist = (bos - price) / bos
         if 0 <= dist < max(0.0075, 0.75 * atr_pct):
             tags.append("⚡ BOS_IMMINENT")
 
-    # ======================================================
-    # 3 — VOLATILITY SQUEEZE (tight + low momentum)
-    # ======================================================
     if len(g) >= 20:
         atr5 = g["High"].tail(5).max() - g["Low"].tail(5).min()
         atr20 = g["High"].tail(20).max() - g["Low"].tail(20).min()
         comp = np.clip(1 - atr5 / max(atr20, 1e-9), 0, 1)
-
         mac_flat = abs(g["MACDH"].tail(5).mean()) < 0.15 * abs(g["MACDH"].tail(20).std() + 1e-9)
-
         if comp > 0.65 and mac_flat:
             tags.append("📉 SQUEEZE")
 
-    # ======================================================
-    # 4 — PERFECT ENTRY (BUY-biased)
-    # ======================================================
     pe = row.get("PERFECT_ENTRY", None)
-
     if pe is not None:
-        # Primary use-case: confirmed BUYs like NCLH
         if row["FINAL_SIGNAL"] == "BUY" and pe >= 80:
             tags.append("🎯 PERFECT_ENTRY")
-        # Optional: ultra-clean WATCH, very close to flipping BUY
         elif (
             row["FINAL_SIGNAL"] == "WATCH"
             and pe >= 90
@@ -1103,51 +1094,31 @@ def generate_insight_tags(row):
         ):
             tags.append("🎯 PERFECT_ENTRY")
 
-    # ======================================================
-    # 5 — STRUCTURE STRONG (now with quality filter)
-    # ======================================================
     if (
         row["FINAL_SIGNAL"] != "BUY"
         and row["ShapePriority"] <= 3
         and row["BREAKOUT_PRESSURE"] > 55
     ):
-        # quality filter → avoid noisy structures
         if g["MACDH"].iloc[-1] > 0 or price > recent["Close"].mean():
             tags.append("🌀 STRUCTURE_STRONG")
 
-    # ======================================================
-    # 6 — EXTENDED BUY
-    # ======================================================
     if row["FINAL_SIGNAL"] == "BUY" and not np.isnan(bos):
         if (price - bos) / bos > 0.05:
             tags.append("🛑 EXTENDED")
 
-    # ======================================================
-    # 8 — EARLY BOS (micro-breakout)
-    # ======================================================
     if price > recent["High"].iloc[:-1].max():
         tags.append("📈 EARLY_BOS")
 
-    # ======================================================
-    # 10 — MACD THRUST (strong momentum expansion)
-    # ======================================================
     if "MACDH" in g.columns:
         mac = g["MACDH"].tail(4).values
         if mac[-1] > 0 and mac[-1] > mac[-2] > mac[-3]:
             tags.append("💥 MACD_THRUST")
 
-    # ======================================================
-    # 11 — ENERGY BUILDUP (tight coil + rising momentum)
-    # ======================================================
     rng_pct = (recent["High"].max() - recent["Low"].min()) / max(price, 1e-9)
     rsi_slope = g["RSI"].tail(5).diff().mean()
-
     if rng_pct < max(0.02, 0.6 * atr_pct) and rsi_slope > 0.15:
         tags.append("🔋 ENERGY_BUILDUP")
 
-    # ======================================================
-    # 12 — REVERSAL CONFIRM (stable version)
-    # ======================================================
     if "MACDH" in g.columns and "RSI" in g.columns:
         mac = g["MACDH"].tail(3).values
         if mac[-1] > 0 and mac[-2] > 0 and mac[-3] < 0 and g["RSI"].iloc[-1] > 50:
@@ -1157,82 +1128,51 @@ def generate_insight_tags(row):
 
 
 def generate_trading_summary(row):
-    """
-    Produces a human-readable trading summary for any ticker
-    with at least one insight tag.
-    """
-
     name = row["Ticker"]
     insights = row["INSIGHT_TAGS"]
     next_action_text = row["NEXT_ACTION"]
     final_signal = row["FINAL_SIGNAL"]
 
-    # -----------------------
-    # INTERPRETATION LOGIC
-    # -----------------------
     interp_parts = []
-
     if "PRIME" in insights:
         interp_parts.append("extremely clean structure, very close to BUY")
-
     if "BOS_IMMINENT" in insights:
         interp_parts.append("price sitting just beneath breakout level")
-
     if "SQUEEZE" in insights:
         interp_parts.append("volatility compression suggests fast breakout behavior")
-
     if "STRUCTURE_STRONG" in insights:
         interp_parts.append("trend geometry is strong with smooth recovery")
-
     if "PERFECT_ENTRY" in insights:
         interp_parts.append("high-quality HL and clean retracement in place")
-
     if "MACD_THRUST" in insights:
         interp_parts.append("momentum expanding into BOS")
-
     if "EARLY_BOS" in insights:
         interp_parts.append("micro-break of minor highs signals early strength")
 
     interpretation = (
-        " | ".join(interp_parts)
-        if interp_parts else
-        "setup is developing but not yet actionable"
+        " | ".join(interp_parts) if interp_parts
+        else "setup is developing but not yet actionable"
     )
 
-    # -----------------------
-    # PRIMARY ENTRY
-    # -----------------------
     if final_signal == "BUY":
         primary_entry = f"Enter on retest of BOS level ({row['LastLocalHigh']:.2f})."
     else:
         primary_entry = f"Trigger if price breaks above {row['LastLocalHigh']:.2f}."
 
-    # -----------------------
-    # ALTERNATE ENTRY
-    # -----------------------
     if final_signal == "BUY":
         alternate_entry = "If no retest occurs, you may enter on continuation strength."
     else:
         alternate_entry = "If breakout fakes out, buy retest of coil or HL region."
 
-    # -----------------------
-    # NO-TRADE CONDITIONS
-    # -----------------------
     no_trade = []
-
     if "SQUEEZE" in insights:
         no_trade.append("avoid if the squeeze breaks downward with momentum")
-
     if "PERFECT_ENTRY" not in insights and final_signal != "BUY":
         no_trade.append("avoid if HL breaks or structure becomes noisy")
-
     if "MACD_THRUST" in insights:
         no_trade.append("avoid if MACD flips red before breakout")
-
     if not no_trade:
         no_trade.append("avoid if the broader market is risk-off")
-
-    no_trade_text = " | ".join(no_trade)
 
     summary = f"""
 Name: {name}
@@ -1250,7 +1190,7 @@ Alternate Trade:
 - {alternate_entry}
 
 No-Trade Conditions:
-- {no_trade_text}
+- {" | ".join(no_trade)}
 """.strip()
 
     return summary
@@ -1260,15 +1200,6 @@ No-Trade Conditions:
 # WRAPPER: run the whole engine and return dataframes
 # =========================================================
 def run_engine():
-    """
-    Runs your full pipeline and returns:
-    - df_all: full OHLC dataframe
-    - combined: final ranked dashboard dataframe
-    - insight_df: subset of combined with non-empty INSIGHT_TAGS
-    - hourly_entries_df: hourly entry candidates built from combined tickers
-    - hourly_rejects_df: hourly rejects diagnostics
-    - hourly_df: full hourly OHLC dataframe used for List B charting
-    """
     df = load_all_market_data()
     watch = build_watchlist(df, lookback_days=LOOKBACK_DAYS)
 
@@ -1277,10 +1208,8 @@ def run_engine():
         insight_df = pd.DataFrame()
         return df, combined, insight_df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    # Enhance watchlist
     watch["Retracement %"] = watch["Retracement"] * 100
 
-    # Entry at 61.8% retracement (not above current price)
     watch["Entry Price"] = watch.apply(
         lambda row: min(
             row["Latest Price"],
@@ -1290,10 +1219,8 @@ def run_engine():
         axis=1,
     )
 
-    # Stop below swing low
     watch["Stop Price"] = watch["Swing Low Price"] * 0.995
 
-    # Target: swing high or 2:1 R:R
     watch["Target Price"] = watch.apply(
         lambda row: min(
             row["Swing High Price"],
@@ -1302,7 +1229,6 @@ def run_engine():
         axis=1,
     )
 
-    # R:R & distances (needed before sorting)
     watch["R:R"] = (watch["Target Price"] - watch["Entry Price"]) / (
         watch["Entry Price"] - watch["Stop Price"]
     )
@@ -1319,7 +1245,6 @@ def run_engine():
         (watch["Target Price"] - watch["Latest Price"]) / watch["Latest Price"]
     ) * 100
 
-    # ---------- SCORING ----------
     watch["RetraceScore"] = watch["Retracement %"].apply(fib_retrace_score)
     watch["StopDistanceScore"] = (
         (watch["Latest Price"] - watch["Stop Price"])
@@ -1333,7 +1258,6 @@ def run_engine():
         + 0.4 * watch["SwingRangeScore"]
     )
 
-    # Prime setups only
     watch["Prime Setup"] = watch["Retracement %"].between(50, 78.6)
     watch = watch[watch["Prime Setup"]]
 
@@ -1342,55 +1266,33 @@ def run_engine():
         insight_df = pd.DataFrame()
         return df, combined, insight_df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    # CONFIRMATION
     confirm = confirmation_engine(df, watch)
-
-    # Add Shape classification ranking
     confirm["ShapePriority"] = confirm["Shape"].apply(shape_priority)
-
-    # Scores & NEXT_ACTION
     confirm["BUY_QUALITY"] = confirm.apply(compute_buy_quality, axis=1)
-    # readiness removed: keep BUY quality and pressure metrics only.
     confirm["NEXT_ACTION"] = confirm.apply(next_action, axis=1)
-
-    # Entry timing & pressure metrics
     confirm["PERFECT_ENTRY"] = confirm.apply(compute_perfect_entry, axis=1)
     confirm["ENTRY_BIAS"] = confirm.apply(compute_entry_bias, axis=1)
     confirm["BREAKOUT_PRESSURE"] = confirm.apply(compute_breakout_pressure, axis=1)
 
-    # Sorting logic (same as your script)
     confirm["SignalPriority"] = confirm["Shape"].apply(shape_priority)
     confirm["WatchPriority"] = confirm.apply(
         lambda r: r.get("BREAKOUT_PRESSURE", 0)
-        if r["FINAL_SIGNAL"] == "WATCH"
-        else -1,
+        if r["FINAL_SIGNAL"] == "WATCH" else -1,
         axis=1,
     )
-
     confirm["BOS_Distance"] = confirm.apply(
-        lambda r: 0
-        if r["BOS"]
-        else (r["LastLocalHigh"] - r["Latest Price"])
-        if not np.isnan(r["LastLocalHigh"])
+        lambda r: 0 if r["BOS"]
+        else (r["LastLocalHigh"] - r["Latest Price"]) if not np.isnan(r["LastLocalHigh"])
         else 9999,
         axis=1,
     )
 
     confirm = confirm.sort_values(
-        by=[
-            "SignalPriority",
-            "WatchPriority",
-            "ShapePriority",
-            "BOS_Distance",
-            "Momentum OK",
-            "Bullish Candle",
-            "HL Formed",
-            "Retr Held",
-        ],
+        by=["SignalPriority", "WatchPriority", "ShapePriority",
+            "BOS_Distance", "Momentum OK", "Bullish Candle", "HL Formed", "Retr Held"],
         ascending=[True, False, True, True, False, False, False, False]
     ).reset_index(drop=True)
 
-    # Insight tags
     confirm["INSIGHT_TAGS"] = confirm.apply(generate_insight_tags, axis=1)
 
     combined = confirm.copy()
@@ -1407,18 +1309,13 @@ def run_engine():
         hourly_entries_df, hourly_rejects_df = build_hourly_entries(combined, hourly_df)
     except Exception as exc:
         import traceback
-
         hourly_df = pd.DataFrame()
         hourly_entries_df = pd.DataFrame()
-        hourly_rejects_df = pd.DataFrame(
-            [
-                {
-                    "Ticker": "__ERROR__",
-                    "RejectReason": "hourly_pipeline_exception",
-                    "Error": str(exc),
-                    "Traceback": traceback.format_exc(),
-                }
-            ]
-        )
+        hourly_rejects_df = pd.DataFrame([{
+            "Ticker": "__ERROR__",
+            "RejectReason": "hourly_pipeline_exception",
+            "Error": str(exc),
+            "Traceback": traceback.format_exc(),
+        }])
 
     return df, combined, insight_df, hourly_entries_df, hourly_rejects_df, hourly_df
