@@ -121,12 +121,19 @@ def find_swing_as_of_quick(group, current_date, lookback_days=LOOKBACK_DAYS):
 
         for i in range(lk, len(bh_highs) - lk):
             if bh_highs[i] == max(bh_highs[max(0, i - lk): i + lk + 1]):
-                # This is a pivot high — and it's necessarily above the
-                # candidate low (since candidate low is a price minimum),
-                # so it qualifies as an intervening higher high
-                intervening_hh_date = pd.to_datetime(bh_dates[i])
-                # Use the MOST RECENT such pivot (closest to current high)
-                # so keep iterating to find the last one
+                # Only re-anchor if this intervening pivot is HIGHER than
+                # the current swing high. If it's lower, it is just a
+                # correction within the same impulse wave and the candidate
+                # low (the absolute trough) is already correct.
+                #
+                # 7625.HK: intervening 11.5 > current 10.68 -> re-anchor
+                # Baidu:   intervening 138  < current 161.2  -> keep 105
+                # Alibaba: intervening 125  < current 186.2  -> keep 101
+                # AMD:     intervening 185  < current 267    -> keep 148
+                # DOW:     intervening 26   < current 34.77  -> keep 20
+                if bh_highs[i] > swing_high_price:
+                    intervening_hh_date = pd.to_datetime(bh_dates[i])
+                    # Use most recent qualifying pivot, keep iterating
 
     # Step 3: re-anchor if an intervening HH was found
     if intervening_hh_date is not None:
