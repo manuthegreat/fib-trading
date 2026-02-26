@@ -1,4 +1,4 @@
-""" updater.py — Yahoo-only, SP500 + HSI + Euro Stoxx 50
+""" updater.py — Yahoo-only, SP500 + HSI
 
 Optimised for Streamlit Cloud:
   - NO threading (exceeds 1 GB RAM limit on Streamlit Cloud)
@@ -7,7 +7,7 @@ Optimised for Streamlit Cloud:
   - Handles BOTH yfinance MultiIndex formats:
       old (pre-0.2): columns = (ticker, field)
       new (0.2.x+):  columns = (field, ticker)
-    This was the root cause of EU tickers silently disappearing.
+    This was previously the root cause of EU tickers silently disappearing.
 
 Expected runtime on Streamlit Cloud: ~60-90 seconds total.
 """
@@ -389,22 +389,20 @@ def download_yahoo_prices(
 
 def load_all_market_data() -> pd.DataFrame:
     """
-    Returns merged DAILY OHLC for SP500 + HSI + Euro Stoxx 50.
+    Returns merged DAILY OHLC for SP500 + HSI.
 
     Downloads universes sequentially to stay within Streamlit Cloud's
     1 GB RAM limit. Each universe is fully downloaded and concatenated
     before the next begins, so peak memory = ~1 universe at a time.
 
-    Target runtime on Streamlit Cloud: ~60-90 seconds.
+    Target runtime on Streamlit Cloud: ~30-50 seconds.
     """
     t0 = time.time()
 
-    sp500     = get_sp500_universe()
-    hsi       = get_hsi_universe()
-    eurostoxx = get_eurostoxx50_universe()
+    sp500 = get_sp500_universe()
+    hsi   = get_hsi_universe()
 
-    print(f"[INFO] Universes — SP500: {len(sp500)}, "
-          f"HSI: {len(hsi)}, EuroStoxx50: {len(eurostoxx)}")
+    print(f"[INFO] Universes — SP500: {len(sp500)}, HSI: {len(hsi)}")
 
     sp_frames = download_yahoo_prices(
         sp500["Ticker"].tolist(), "SP500", period="600d", interval="1d"
@@ -412,11 +410,8 @@ def load_all_market_data() -> pd.DataFrame:
     hs_frames = download_yahoo_prices(
         hsi["Ticker"].tolist(), "HSI", period="600d", interval="1d"
     )
-    eu_frames = download_yahoo_prices(
-        eurostoxx["Ticker"].tolist(), "EUROSTOXX50", period="600d", interval="1d"
-    )
 
-    all_frames = sp_frames + hs_frames + eu_frames
+    all_frames = sp_frames + hs_frames
     if not all_frames:
         raise RuntimeError("No DAILY OHLC data downloaded from Yahoo Finance")
 
