@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 import yfinance as yf  # still unused but kept in case you extend later
 from datetime import datetime, timedelta
-from updater import load_all_market_data
 
 
 # Optional: console display settings (used only if you print from here)
