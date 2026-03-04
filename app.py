@@ -106,13 +106,6 @@ st.info(
     + _replay_suffix
 )
 
-# ==========================================================
-# SIDEBAR
-# ==========================================================
-st.sidebar.header("Settings")
-lookback_days = st.sidebar.slider("Chart lookback (days)", 60, 500, 180, 10)
-st.sidebar.write("---")
-st.sidebar.write("Run after market close / before open.")
 
 # ==========================================================
 # ENGINE RUN (two-level cache: raw data once + per-date computation)
@@ -163,8 +156,7 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
 
     ranked_hourly = rank_hourly_candidates(hourly_entries_df)
 
-    top_n    = st.slider("Show top N setups", 5, 50, 15, 5)
-    show_top = ranked_hourly.head(top_n).reset_index(drop=True)
+    show_top = ranked_hourly.reset_index(drop=True)
 
     display_cols = {
         "Ticker":                    "Ticker",
@@ -239,7 +231,11 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
             ticker_hourly["DateTime"] = pd.to_datetime(
                 ticker_hourly["DateTime"], errors="coerce", utc=True
             ).dt.tz_convert(None)
-            ticker_hourly = ticker_hourly.dropna(subset=["DateTime"]).sort_values("DateTime")
+            ticker_hourly = (
+                ticker_hourly.dropna(subset=["DateTime"])
+                .sort_values("DateTime")
+                .reset_index(drop=True)
+            )
 
             high_dt = pd.to_datetime(hrow.get("local_high_time"),  errors="coerce", utc=True)
             retr_dt = pd.to_datetime(hrow.get("DailyRetrLowDate"), errors="coerce", utc=True)
@@ -262,13 +258,40 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
                     win_start = fallback["DateTime"].min()
                     win_end   = fallback["DateTime"].max()
 
+            # ----------------------------------------------------------
+            # Gap-free x-axis: each bar → sequential integer position.
+            # Non-trading hours / weekends simply have no bar, so there
+            # is no blank space — identical to Bloomberg / TradingView.
+            # DateTime labels are shown as formatted strings on the axis.
+            # ----------------------------------------------------------
+            n_bars   = len(ticker_hourly)
+            x_ints   = list(range(n_bars))
+            x_labels = ticker_hourly["DateTime"].dt.strftime("%b %d %H:%M").tolist()
+
+            # Convert datetime window → integer index range
+            win_mask = (
+                (ticker_hourly["DateTime"] >= win_start) &
+                (ticker_hourly["DateTime"] <= win_end)
+            )
+            win_idxs = ticker_hourly.index[win_mask].tolist()
+            if win_idxs:
+                idx_lo, idx_hi = win_idxs[0], win_idxs[-1]
+            else:
+                idx_lo, idx_hi = max(0, n_bars - 240), n_bars - 1
+
+            # ~8 evenly-spaced tick labels across the visible window
+            n_visible = max(idx_hi - idx_lo + 1, 1)
+            step = max(1, n_visible // 8)
+            tick_vals  = list(range(idx_lo, idx_hi + 1, step))
+            tick_texts = [x_labels[i] for i in tick_vals if i < n_bars]
+
             st.markdown(
                 f"**{hourly_ticker_selected}** &nbsp;|&nbsp; "
                 f"{hrow.get('FOCUS', '')} (Score: {hrow.get('FOCUS_SCORE', '—')})"
             )
 
             fig_h = go.Figure(data=[go.Candlestick(
-                x=ticker_hourly["DateTime"],
+                x=x_ints,
                 open=ticker_hourly["Open"], high=ticker_hourly["High"],
                 low=ticker_hourly["Low"],   close=ticker_hourly["Close"],
                 name=hourly_ticker_selected,
@@ -290,16 +313,17 @@ if hourly_entries_df is not None and not hourly_entries_df.empty:
 
             fig_h.update_layout(
                 title=f"{hourly_ticker_selected} — Hourly",
-                xaxis_title="DateTime", yaxis_title="Price",
+                yaxis_title="Price",
                 xaxis_rangeslider_visible=False,
                 template="plotly_white", height=480,
             )
-            fig_h.update_xaxes(range=[win_start, win_end])
+            fig_h.update_xaxes(
+                range=[idx_lo - 0.5, idx_hi + 0.5],
+                tickvals=tick_vals,
+                ticktext=tick_texts,
+            )
 
-            vis2 = ticker_hourly[
-                (ticker_hourly["DateTime"] >= win_start) &
-                (ticker_hourly["DateTime"] <= win_end)
-            ]
+            vis2 = ticker_hourly.iloc[idx_lo : idx_hi + 1]
             if not vis2.empty:
                 y_lo = pd.to_numeric(vis2["Low"],  errors="coerce").min()
                 y_hi = pd.to_numeric(vis2["High"], errors="coerce").max()
@@ -488,6 +512,9 @@ if ticker_selected:
     with c2: st.metric("Swing Low",   f"{swing_l:.2f}" if pd.notna(swing_l) else "N/A")
     with c3: st.metric("Retracement", f"{retr_pct:.1f}%" if pd.notna(retr_pct) else "N/A")
 
+    lookback_days = st.slider(
+        "Chart lookback (days)", 60, 500, 180, 10, key="daily_lookback_slider"
+    )
     plot_ticker_chart(df_all, row_sel, lookback_days=lookback_days)
 
     hourly_sel = None
