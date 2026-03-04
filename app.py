@@ -46,6 +46,8 @@ def compute_focus_score(row: pd.Series) -> float:
     if not np.isnan(rr) and rr > 0:
         score += 30.0 * min(rr / 5.0, 1.0)
 
+    score -= float(row.get("lower_high_penalty", 0.0))
+
     return round(float(np.clip(score, 0.0, 100.0)), 1)
 
 
@@ -54,6 +56,39 @@ def _focus_label(score: float) -> str:
     if score >= 65: return "🟠 HIGH"
     if score >= 45: return "🟡 MEDIUM"
     return "⚪ LOW"
+
+
+def compute_daily_score(row: pd.Series, hourly_entries_df) -> float:
+    score = 0.0
+
+    # --- Fib depth (40 pts) ---
+    # Peaks at 61.8%, decays to zero at the 38.2% and 78.6% edges (±20 pp).
+    retr_pct = pd.to_numeric(row.get("Retracement %"), errors="coerce")
+    if pd.notna(retr_pct):
+        score += 40.0 * max(0.0, 1.0 - abs(retr_pct - 61.8) / 20.0)
+
+    # --- R:R potential (35 pts), capped at 4:1 ---
+    swing_high = pd.to_numeric(row.get("SwingHigh"),    errors="coerce")
+    swing_low  = pd.to_numeric(row.get("SwingLow"),     errors="coerce")
+    price      = pd.to_numeric(row.get("Latest Price"), errors="coerce")
+    if pd.notna(swing_high) and pd.notna(swing_low) and pd.notna(price):
+        reward = swing_high - price
+        risk   = price - swing_low
+        if risk > 0 and reward > 0:
+            score += 35.0 * min((reward / risk) / 4.0, 1.0)
+
+    # --- Active hourly candidate bonus (25 pts) ---
+    ticker = row.get("Ticker")
+    if (
+        ticker is not None
+        and hourly_entries_df is not None
+        and not hourly_entries_df.empty
+        and "Ticker" in hourly_entries_df.columns
+        and ticker in hourly_entries_df["Ticker"].values
+    ):
+        score += 25.0
+
+    return round(float(np.clip(score, 0.0, 100.0)), 1)
 
 
 def rank_hourly_candidates(hourly_df: pd.DataFrame) -> pd.DataFrame:
@@ -364,7 +399,15 @@ swing_range  = (ranked_table["SwingHigh"] - ranked_table["SwingLow"]).replace(0,
 ranked_table["Retracement %"] = (
     (ranked_table["SwingHigh"] - ranked_table["Latest Price"]) / swing_range * 100
 ).round(1)
-ranked_table = ranked_table.drop(columns=["Latest Price"])
+ranked_table["Daily Score"] = ranked_table.apply(
+    lambda r: compute_daily_score(r, hourly_entries_df), axis=1
+)
+ranked_table = (
+    ranked_table
+    .drop(columns=["Latest Price"])
+    .sort_values("Daily Score", ascending=False)
+    .reset_index(drop=True)
+)
 
 event = st.dataframe(
     ranked_table,
