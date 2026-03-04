@@ -839,6 +839,43 @@ def build_hourly_entries(
         distance_to_entry_618_pct = (last_close - entry_618) / entry_618
         entry_618_hit = (last_low <= entry_618) and (entry_618 <= last_high)
 
+        # ----------------------------------------------------------------
+        # LOWER-HIGH PENALTY
+        # Bars strictly after swing_high_time, excluding the last
+        # min_bars_since_high bars (the current pullback confirmation tail).
+        # ----------------------------------------------------------------
+        post_high_bars = after_low[after_low["DateTime"] > swing_high_time]
+        if len(post_high_bars) > min_bars_since_high:
+            post_high_bars = post_high_bars.iloc[:-min_bars_since_high]
+        else:
+            post_high_bars = post_high_bars.iloc[:0]
+
+        ph_highs = post_high_bars["High"].values
+        pivot_prices = []
+        for _i in range(1, len(ph_highs) - 1):
+            if ph_highs[_i] > ph_highs[_i - 1] and ph_highs[_i] > ph_highs[_i + 1]:
+                pivot_prices.append(float(ph_highs[_i]))
+
+        max_consec_lh = 0
+        if len(pivot_prices) >= 2:
+            current_run = 0
+            for _i in range(1, len(pivot_prices)):
+                if pivot_prices[_i] < pivot_prices[_i - 1]:
+                    current_run += 1
+                    if current_run > max_consec_lh:
+                        max_consec_lh = current_run
+                else:
+                    current_run = 0
+
+        if max_consec_lh == 0:
+            lower_high_penalty = 0.0
+        elif max_consec_lh == 1:
+            lower_high_penalty = 10.0
+        elif max_consec_lh == 2:
+            lower_high_penalty = 20.0
+        else:
+            lower_high_penalty = 35.0
+
         entries.append({
             "Ticker":                    ticker,
             "DailyRetrLowDate":          anchor_low_dt,
@@ -857,6 +894,7 @@ def build_hourly_entries(
             "bars_since_high":           bars_since_high,
             "distance_to_entry_618_pct": distance_to_entry_618_pct,
             "entry_618_hit":             bool(entry_618_hit),
+            "lower_high_penalty":        lower_high_penalty,
         })
 
     entries_df = pd.DataFrame(entries)
