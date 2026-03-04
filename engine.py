@@ -1289,10 +1289,58 @@ No-Trade Conditions:
 
 
 # =========================================================
+# DATA LOADER (for two-level Streamlit caching)
+# =========================================================
+def load_engine_data():
+    """
+    Download and return raw market data: daily OHLC for all tickers and
+    hourly OHLC for today's prime-setup tickers (retracement 50–78.6%).
+
+    Intended to be cached with just engine_version as the key so that
+    switching replay dates does NOT trigger new yfinance downloads.
+    """
+    daily_df = load_all_market_data()
+
+    watch = build_watchlist(daily_df, lookback_days=LOOKBACK_DAYS)
+    tickers: list = []
+    if not watch.empty:
+        prime = watch[watch["Retracement"].between(0.50, 0.786)]
+        if not prime.empty:
+            tickers = prime["Ticker"].unique().tolist()
+
+    from updater import load_hourly_prices_for_tickers
+    hourly_df = load_hourly_prices_for_tickers(tickers)
+    return daily_df, hourly_df
+
+
+# =========================================================
 # WRAPPER: run the whole engine and return dataframes
 # =========================================================
-def run_engine():
-    df = load_all_market_data()
+def run_engine(daily_df=None, hourly_df_raw=None, as_of_date=None):
+    """
+    Run the full Fibonacci trading engine.
+
+    Parameters
+    ----------
+    daily_df      : pd.DataFrame, optional
+        Pre-loaded daily OHLC data. If None, downloads fresh from Yahoo Finance.
+    hourly_df_raw : pd.DataFrame, optional
+        Pre-loaded hourly OHLC data. If None, downloads for qualifying tickers.
+    as_of_date    : datetime.date or None
+        Historical replay date. None = use the latest available bar (live mode).
+        Daily data is filtered to Date <= as_of_date.
+        Hourly data is filtered to DateTime <= as_of_date 18:00 SGT (= 10:00 UTC).
+    """
+    if daily_df is None:
+        daily_df = load_all_market_data()
+
+    df = daily_df
+
+    # --- Apply as_of_date filter to daily data ---
+    if as_of_date is not None:
+        as_of_ts = pd.Timestamp(as_of_date)
+        df = df[df["Date"] <= as_of_ts].copy()
+
     watch = build_watchlist(df, lookback_days=LOOKBACK_DAYS)
 
     if watch.empty:
@@ -1396,8 +1444,22 @@ def run_engine():
     insight_df = combined[combined["INSIGHT_TAGS"] != ""].copy()
 
     try:
-        from updater import load_hourly_prices_for_tickers
-        hourly_df = load_hourly_prices_for_tickers(combined["Ticker"].unique().tolist())
+        if hourly_df_raw is None:
+            from updater import load_hourly_prices_for_tickers
+            hourly_df = load_hourly_prices_for_tickers(combined["Ticker"].unique().tolist())
+        else:
+            hourly_df = hourly_df_raw.copy()
+
+        # --- Apply as_of_date filter to hourly data ---
+        # Cutoff: as_of_date 18:00 SGT = as_of_date 10:00 UTC (SGT = UTC+8)
+        if as_of_date is not None and not hourly_df.empty and "DateTime" in hourly_df.columns:
+            as_of_ts = pd.Timestamp(as_of_date)
+            cutoff_utc = as_of_ts + pd.Timedelta(hours=10)  # 18:00 SGT = 10:00 UTC
+            h_dt = pd.to_datetime(hourly_df["DateTime"], errors="coerce")
+            if h_dt.dt.tz is not None:
+                h_dt = h_dt.dt.tz_convert("UTC").dt.tz_localize(None)
+            hourly_df = hourly_df.loc[h_dt <= cutoff_utc].copy()
+
         hourly_entries_df, hourly_rejects_df = build_hourly_entries(combined, hourly_df)
     except Exception as exc:
         import traceback

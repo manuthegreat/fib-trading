@@ -1,9 +1,11 @@
+import datetime
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 
-from engine import run_engine, generate_trading_summary
+from engine import run_engine, generate_trading_summary, load_engine_data
 
 
 # ==========================================================
@@ -86,6 +88,25 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================================
+# DATE PICKER  (replay up to 30 days back)
+# ==========================================================
+_today = datetime.date.today()
+selected_date = st.date_input(
+    "View as of date",
+    value=_today,
+    min_value=_today - datetime.timedelta(days=30),
+    max_value=_today,
+    help="Pick any date up to 30 days back to replay the dashboard snapshot. "
+         "No new data downloads — all history is already in memory.",
+)
+_as_of_str = selected_date.strftime("%Y-%m-%d")
+_replay_suffix = " *(live)*" if selected_date == _today else " *(replay)*"
+st.info(
+    f"Showing setups as of **{selected_date.strftime('%d %b %Y')} 18:00 SGT**"
+    + _replay_suffix
+)
+
+# ==========================================================
 # SIDEBAR
 # ==========================================================
 st.sidebar.header("Settings")
@@ -94,19 +115,27 @@ st.sidebar.write("---")
 st.sidebar.write("Run after market close / before open.")
 
 # ==========================================================
-# ENGINE RUN (cached)
+# ENGINE RUN (two-level cache: raw data once + per-date computation)
 # ==========================================================
 ENGINE_VERSION = "2026-02-26-clean-ui-v1"
 
 
-@st.cache_data(show_spinner="Running engine… ~30-50s on first load.")
-def compute_dashboard(engine_version):
-    _ = engine_version
-    return run_engine()
+@st.cache_data(show_spinner="Loading market data… ~30-50s on first load.")
+def _load_raw_data(engine_version):
+    """Download daily + hourly data once. Shared across all replay dates."""
+    return load_engine_data()
+
+
+@st.cache_data(show_spinner="Computing setups for selected date…")
+def compute_dashboard(engine_version, as_of_date_str):
+    """Run the engine on pre-cached data for the given date. Instant after first load."""
+    daily_df, hourly_df = _load_raw_data(engine_version)
+    as_of = datetime.date.fromisoformat(as_of_date_str)
+    return run_engine(daily_df=daily_df, hourly_df_raw=hourly_df, as_of_date=as_of)
 
 
 (df_all, combined, insight_df,
- hourly_entries_df, hourly_rejects_df, hourly_df) = compute_dashboard(ENGINE_VERSION)
+ hourly_entries_df, hourly_rejects_df, hourly_df) = compute_dashboard(ENGINE_VERSION, _as_of_str)
 
 if combined.empty:
     st.error("No names in watchlist. Check data or parameters.")
