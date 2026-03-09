@@ -414,6 +414,9 @@ if unified_ticker_selected:
         and unified_ticker_selected in ranked_hourly["Ticker"].values
     )
 
+    # Always show the daily chart first
+    plot_ticker_chart(df_all, row_sel)
+
     if has_hourly:
         # --- Hourly candlestick chart with Fib lines ---
         sel_row_df    = ranked_hourly[ranked_hourly["Ticker"] == unified_ticker_selected]
@@ -530,8 +533,59 @@ if unified_ticker_selected:
         render_entry_card(hourly_row=sel_row_df if not sel_row_df.empty else None)
 
     else:
-        # --- Daily candlestick chart with Fib levels only ---
-        plot_ticker_chart(df_all, row_sel)
+        # --- Hourly candlestick chart with no Fib lines (last 240 bars) ---
+        ticker_hourly = hourly_df[hourly_df["Ticker"] == unified_ticker_selected].copy()
+
+        if not ticker_hourly.empty:
+            ticker_hourly["DateTime"] = pd.to_datetime(
+                ticker_hourly["DateTime"], errors="coerce", utc=True
+            ).dt.tz_convert(None)
+            ticker_hourly = (
+                ticker_hourly.dropna(subset=["DateTime"])
+                .sort_values("DateTime")
+                .reset_index(drop=True)
+            )
+
+            n_bars   = len(ticker_hourly)
+            x_ints   = list(range(n_bars))
+            x_labels = ticker_hourly["DateTime"].dt.strftime("%b %d %H:%M").tolist()
+
+            idx_lo = max(0, n_bars - 240)
+            idx_hi = n_bars - 1
+
+            n_visible = max(idx_hi - idx_lo + 1, 1)
+            step = max(1, n_visible // 8)
+            tick_vals  = list(range(idx_lo, idx_hi + 1, step))
+            tick_texts = [x_labels[i] for i in tick_vals if i < n_bars]
+
+            fig_h = go.Figure(data=[go.Candlestick(
+                x=x_ints,
+                open=ticker_hourly["Open"], high=ticker_hourly["High"],
+                low=ticker_hourly["Low"],   close=ticker_hourly["Close"],
+                name=unified_ticker_selected,
+            )])
+
+            fig_h.update_layout(
+                title=f"{unified_ticker_selected} — Hourly",
+                yaxis_title="Price",
+                xaxis_rangeslider_visible=False,
+                template="plotly_white", height=480,
+            )
+            fig_h.update_xaxes(
+                range=[idx_lo - 0.5, idx_hi + 0.5],
+                tickvals=tick_vals,
+                ticktext=tick_texts,
+            )
+
+            vis2 = ticker_hourly.iloc[idx_lo : idx_hi + 1]
+            if not vis2.empty:
+                y_lo = pd.to_numeric(vis2["Low"],  errors="coerce").min()
+                y_hi = pd.to_numeric(vis2["High"], errors="coerce").max()
+                if pd.notna(y_lo) and pd.notna(y_hi):
+                    pad = max((y_hi - y_lo) * 0.08, y_hi * 0.002)
+                    fig_h.update_yaxes(range=[y_lo - pad, y_hi + pad])
+
+            st.plotly_chart(fig_h, use_container_width=True)
 
 else:
     st.info("Select a row from the table to see charts and trade levels.")
