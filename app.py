@@ -31,21 +31,32 @@ def compute_focus_score(row: pd.Series) -> float:
     dist  = float(row.get("distance_to_entry_618_pct", 0.10))
     hit   = bool(row.get("entry_618_hit", False))
 
+    # --- Entry proximity (40 pts) ---
     if hit:
-        proximity_score = 55.0
+        proximity_score = 40.0
     elif dist > 0:
-        proximity_score = 55.0 * max(0.0, 1.0 - dist / 0.10)
+        proximity_score = 40.0 * max(0.0, 1.0 - dist / 0.10)
     else:
-        proximity_score = 55.0 * max(0.0, 1.0 + dist / 0.05)
+        proximity_score = 40.0 * max(0.0, 1.0 + dist / 0.05)
     score += proximity_score
 
+    # --- Entry hit bonus (+15 pts) ---
     if hit:
         score += 15.0
 
+    # --- R:R (25 pts), capped at 5:1 ---
     rr = float(row.get("rr", np.nan))
     if not np.isnan(rr) and rr > 0:
-        score += 30.0 * min(rr / 5.0, 1.0)
+        score += 25.0 * min(rr / 5.0, 1.0)
 
+    # --- Hourly swing range size (20 pts) ---
+    local_high = pd.to_numeric(row.get("local_high"), errors="coerce")
+    stop       = pd.to_numeric(row.get("stop"),       errors="coerce")
+    if pd.notna(local_high) and pd.notna(stop) and stop > 0:
+        hourly_swing_pct = (local_high - stop) / stop * 100.0
+        score += 20.0 * min(hourly_swing_pct / 10.0, 1.0)
+
+    # --- Lower high penalty ---
     score -= float(row.get("lower_high_penalty", 0.0))
 
     return round(float(np.clip(score, 0.0, 100.0)), 1)
@@ -58,27 +69,43 @@ def _focus_label(score: float) -> str:
     return "⚪ LOW"
 
 
-def compute_daily_score(row: pd.Series, hourly_entries_df) -> float:
+def compute_daily_score(row: pd.Series, hourly_entries_df, df_all) -> float:
     score = 0.0
 
-    # --- Fib depth (40 pts) ---
-    # Peaks at 61.8%, decays to zero at the 38.2% and 78.6% edges (±20 pp).
-    retr_pct = pd.to_numeric(row.get("Retracement %"), errors="coerce")
-    if pd.notna(retr_pct):
-        score += 40.0 * max(0.0, 1.0 - abs(retr_pct - 61.8) / 20.0)
+    swing_high = pd.to_numeric(row.get("SwingHigh"), errors="coerce")
+    swing_low  = pd.to_numeric(row.get("SwingLow"),  errors="coerce")
+    ticker     = row.get("Ticker")
 
-    # --- R:R potential (35 pts), capped at 4:1 ---
-    swing_high = pd.to_numeric(row.get("SwingHigh"),    errors="coerce")
-    swing_low  = pd.to_numeric(row.get("SwingLow"),     errors="coerce")
-    price      = pd.to_numeric(row.get("Latest Price"), errors="coerce")
-    if pd.notna(swing_high) and pd.notna(swing_low) and pd.notna(price):
-        reward = swing_high - price
-        risk   = price - swing_low
-        if risk > 0 and reward > 0:
-            score += 35.0 * min((reward / risk) / 4.0, 1.0)
+    swing_range = (swing_high - swing_low) if (pd.notna(swing_high) and pd.notna(swing_low)) else np.nan
 
-    # --- Active hourly candidate bonus (25 pts) ---
-    ticker = row.get("Ticker")
+    # --- Zone freshness (35 pts) ---
+    # How recently did price first enter the 50–78.6% Fib zone?
+    freshness_score = 15.0  # neutral default if entry date cannot be determined
+    if (
+        pd.notna(swing_high) and pd.notna(swing_range) and swing_range > 0
+        and ticker is not None
+        and df_all is not None
+        and not df_all.empty
+        and "Ticker" in df_all.columns
+    ):
+        zone_threshold = swing_high - 0.50 * swing_range
+        ticker_data = df_all[df_all["Ticker"] == ticker].sort_values("Date").copy()
+        if not ticker_data.empty and "Close" in ticker_data.columns and "Date" in ticker_data.columns:
+            in_zone = ticker_data[pd.to_numeric(ticker_data["Close"], errors="coerce") <= zone_threshold]
+            if not in_zone.empty:
+                first_entry_date = pd.to_datetime(in_zone["Date"].iloc[0])
+                today = pd.Timestamp.today().normalize()
+                days_in_zone = max(0, (today - first_entry_date).days)
+                freshness_score = 35.0 * max(0.0, 1.0 - days_in_zone / 30.0)
+    score += freshness_score
+
+    # --- Swing strength (35 pts) ---
+    # Size of the daily swing range as a percentage of the swing low price.
+    if pd.notna(swing_high) and pd.notna(swing_low) and swing_low > 0:
+        swing_pct = (swing_high - swing_low) / swing_low * 100.0
+        score += 35.0 * min(swing_pct / 20.0, 1.0)
+
+    # --- Active hourly candidate (30 pts) ---
     if (
         ticker is not None
         and hourly_entries_df is not None
@@ -86,7 +113,7 @@ def compute_daily_score(row: pd.Series, hourly_entries_df) -> float:
         and "Ticker" in hourly_entries_df.columns
         and ticker in hourly_entries_df["Ticker"].values
     ):
-        score += 25.0
+        score += 30.0
 
     return round(float(np.clip(score, 0.0, 100.0)), 1)
 
@@ -218,7 +245,7 @@ _daily_base["Retracement %"] = (
     (_daily_base["SwingHigh"] - _daily_base["Latest Price"]) / _swing_range * 100
 ).round(1)
 _daily_base["Daily Score"] = _daily_base.apply(
-    lambda r: compute_daily_score(r, hourly_entries_df), axis=1
+    lambda r: compute_daily_score(r, hourly_entries_df, df_all), axis=1
 )
 _daily_base = _daily_base.rename(columns={"SwingHigh": "Swing High", "SwingLow": "Swing Low"})
 _daily_base = _daily_base.drop(columns=["Latest Price"])
