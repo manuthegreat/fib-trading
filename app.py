@@ -176,200 +176,12 @@ if df_view.empty:
 
 
 # ==========================================================
-# HOURLY ENTRY CANDIDATES
+# HOURLY CANDIDATES — ranked (needed for join + chart rendering)
 # ==========================================================
-st.write("---")
-st.write("### ⏱️ Hourly Entry Candidates")
-st.markdown("""
-Ranked by **Focus Score** — how actionable the setup is right now.  
-`🔴 ACT NOW` ≥ 85  ·  `🟠 HIGH` ≥ 65  ·  `🟡 MEDIUM` ≥ 45  ·  `⚪ LOW` < 45
-""")
-
 ranked_hourly = pd.DataFrame()
 
 if hourly_entries_df is not None and not hourly_entries_df.empty:
-
     ranked_hourly = rank_hourly_candidates(hourly_entries_df)
-
-    show_top = ranked_hourly.reset_index(drop=True)
-
-    display_cols = {
-        "Ticker":                    "Ticker",
-        "FOCUS":                     "Focus",
-        "FOCUS_SCORE":               "Score",
-        "entry_618_hit":             "At Entry?",
-        "entry_618":                 "Entry 61.8%",
-        "stop":                      "Stop",
-        "take_profit":               "Target",
-        "rr":                        "R:R",
-        "distance_to_entry_618_pct": "Dist to Entry",
-        "retrace_from_high_pct":     "Retrace %",
-        "bars_since_high":           "Bars Since High",
-    }
-
-    avail_cols  = {k: v for k, v in display_cols.items() if k in show_top.columns}
-    hourly_view = show_top[list(avail_cols.keys())].rename(columns=avail_cols).copy()
-
-    for col_raw, col_display in [
-        ("distance_to_entry_618_pct", "Dist to Entry"),
-        ("retrace_from_high_pct",     "Retrace %"),
-    ]:
-        if col_display in hourly_view.columns:
-            hourly_view[col_display] = (
-                pd.to_numeric(hourly_view[col_display], errors="coerce") * 100
-            ).round(2).astype(str) + "%"
-
-    if "R:R" in hourly_view.columns:
-        hourly_view["R:R"] = pd.to_numeric(hourly_view["R:R"], errors="coerce").round(2)
-
-    if "At Entry?" in hourly_view.columns:
-        hourly_view["At Entry?"] = hourly_view["At Entry?"].map(
-            {True: "✅ YES", False: "—", 1: "✅ YES", 0: "—"}
-        ).fillna("—")
-
-    hourly_event = st.dataframe(
-        hourly_view,
-        hide_index=True,
-        use_container_width=True,
-        key="hourly_ranked_df",
-        on_select="rerun",
-        selection_mode="single-row",
-    )
-
-    hourly_selected_rows = []
-    if hourly_event is not None:
-        if hasattr(hourly_event, "selection") and hasattr(hourly_event.selection, "rows"):
-            hourly_selected_rows = hourly_event.selection.rows
-        elif isinstance(hourly_event, dict):
-            hourly_selected_rows = hourly_event.get("selection", {}).get("rows", [])
-
-    if "hourly_selected_ticker" not in st.session_state:
-        st.session_state.hourly_selected_ticker = (
-            show_top.iloc[0]["Ticker"] if not show_top.empty else None
-        )
-
-    if hourly_selected_rows:
-        idx = hourly_selected_rows[0]
-        if 0 <= idx < len(show_top):
-            st.session_state.hourly_selected_ticker = show_top.iloc[idx]["Ticker"]
-
-    hourly_ticker_selected = st.session_state.hourly_selected_ticker
-
-    # --- Hourly chart ---
-    if hourly_ticker_selected and hourly_df is not None and not hourly_df.empty:
-        sel_row_df    = ranked_hourly[ranked_hourly["Ticker"] == hourly_ticker_selected]
-        ticker_hourly = hourly_df[hourly_df["Ticker"] == hourly_ticker_selected].copy()
-
-        if not sel_row_df.empty and not ticker_hourly.empty:
-            hrow = sel_row_df.iloc[0]
-
-            ticker_hourly["DateTime"] = pd.to_datetime(
-                ticker_hourly["DateTime"], errors="coerce", utc=True
-            ).dt.tz_convert(None)
-            ticker_hourly = (
-                ticker_hourly.dropna(subset=["DateTime"])
-                .sort_values("DateTime")
-                .reset_index(drop=True)
-            )
-
-            high_dt = pd.to_datetime(hrow.get("local_high_time"),  errors="coerce", utc=True)
-            retr_dt = pd.to_datetime(hrow.get("DailyRetrLowDate"), errors="coerce", utc=True)
-            if pd.notna(high_dt): high_dt = high_dt.tz_convert(None)
-            if pd.notna(retr_dt): retr_dt = retr_dt.tz_convert(None)
-
-            max_dt    = ticker_hourly["DateTime"].max()
-            win_start = (high_dt - pd.Timedelta(hours=72)) if pd.notna(high_dt) else (max_dt - pd.Timedelta(hours=72))
-            if pd.notna(retr_dt):
-                win_start = min(retr_dt, win_start)
-            win_end = max_dt
-
-            visible = ticker_hourly[
-                (ticker_hourly["DateTime"] >= win_start) &
-                (ticker_hourly["DateTime"] <= win_end)
-            ]
-            if len(visible) < 50:
-                fallback = ticker_hourly.tail(240)
-                if not fallback.empty:
-                    win_start = fallback["DateTime"].min()
-                    win_end   = fallback["DateTime"].max()
-
-            # ----------------------------------------------------------
-            # Gap-free x-axis: each bar → sequential integer position.
-            # Non-trading hours / weekends simply have no bar, so there
-            # is no blank space — identical to Bloomberg / TradingView.
-            # DateTime labels are shown as formatted strings on the axis.
-            # ----------------------------------------------------------
-            n_bars   = len(ticker_hourly)
-            x_ints   = list(range(n_bars))
-            x_labels = ticker_hourly["DateTime"].dt.strftime("%b %d %H:%M").tolist()
-
-            # Convert datetime window → integer index range
-            win_mask = (
-                (ticker_hourly["DateTime"] >= win_start) &
-                (ticker_hourly["DateTime"] <= win_end)
-            )
-            win_idxs = ticker_hourly.index[win_mask].tolist()
-            if win_idxs:
-                idx_lo, idx_hi = win_idxs[0], win_idxs[-1]
-            else:
-                idx_lo, idx_hi = max(0, n_bars - 240), n_bars - 1
-
-            # ~8 evenly-spaced tick labels across the visible window
-            n_visible = max(idx_hi - idx_lo + 1, 1)
-            step = max(1, n_visible // 8)
-            tick_vals  = list(range(idx_lo, idx_hi + 1, step))
-            tick_texts = [x_labels[i] for i in tick_vals if i < n_bars]
-
-            st.markdown(
-                f"**{hourly_ticker_selected}** &nbsp;|&nbsp; "
-                f"{hrow.get('FOCUS', '')} (Score: {hrow.get('FOCUS_SCORE', '—')})"
-            )
-
-            fig_h = go.Figure(data=[go.Candlestick(
-                x=x_ints,
-                open=ticker_hourly["Open"], high=ticker_hourly["High"],
-                low=ticker_hourly["Low"],   close=ticker_hourly["Close"],
-                name=hourly_ticker_selected,
-            )])
-
-            for col, label, color in [
-                ("entry_382",   "Entry 38.2%", "#1f77b4"),
-                ("entry_50",    "Entry 50%",   "#9467bd"),
-                ("entry_618",   "Entry 61.8%", "#ff7f0e"),
-                ("stop",        "Stop",        "#d62728"),
-                ("take_profit", "Target",      "#2ca02c"),
-            ]:
-                val = hrow.get(col)
-                if val is not None and pd.notna(val):
-                    fig_h.add_hline(
-                        y=float(val), line_dash="dash", line_color=color,
-                        annotation_text=label, annotation_position="top left",
-                    )
-
-            fig_h.update_layout(
-                title=f"{hourly_ticker_selected} — Hourly",
-                yaxis_title="Price",
-                xaxis_rangeslider_visible=False,
-                template="plotly_white", height=480,
-            )
-            fig_h.update_xaxes(
-                range=[idx_lo - 0.5, idx_hi + 0.5],
-                tickvals=tick_vals,
-                ticktext=tick_texts,
-            )
-
-            vis2 = ticker_hourly.iloc[idx_lo : idx_hi + 1]
-            if not vis2.empty:
-                y_lo = pd.to_numeric(vis2["Low"],  errors="coerce").min()
-                y_hi = pd.to_numeric(vis2["High"], errors="coerce").max()
-                if pd.notna(y_lo) and pd.notna(y_hi):
-                    pad = max((y_hi - y_lo) * 0.08, y_hi * 0.002)
-                    fig_h.update_yaxes(range=[y_lo - pad, y_hi + pad])
-
-            st.plotly_chart(fig_h, use_container_width=True)
-
-else:
-    st.info("No hourly entry candidates found for current run.")
 
 
 # ==========================================================
@@ -390,50 +202,103 @@ with col3:
 
 
 # ==========================================================
-# DAILY WATCHLIST TABLE
+# UNIFIED WATCHLIST TABLE
 # ==========================================================
-st.write("### 📋 Daily Watchlist (Fib Zone)")
+st.write("---")
+st.markdown("""
+### 📋 Watchlist
+Ranked by **Daily Score** descending.
+`🔴 ACT NOW` ≥ 85  ·  `🟠 HIGH` ≥ 65  ·  `🟡 MEDIUM` ≥ 45  ·  `⚪ LOW` < 45
+""")
 
-ranked_table = df_view[["Ticker", "SwingHigh", "SwingLow", "Latest Price"]].copy()
-swing_range  = (ranked_table["SwingHigh"] - ranked_table["SwingLow"]).replace(0, pd.NA)
-ranked_table["Retracement %"] = (
-    (ranked_table["SwingHigh"] - ranked_table["Latest Price"]) / swing_range * 100
+# Build daily base
+_daily_base = df_view[["Ticker", "SwingHigh", "SwingLow", "Latest Price"]].copy()
+_swing_range = (_daily_base["SwingHigh"] - _daily_base["SwingLow"]).replace(0, pd.NA)
+_daily_base["Retracement %"] = (
+    (_daily_base["SwingHigh"] - _daily_base["Latest Price"]) / _swing_range * 100
 ).round(1)
-ranked_table["Daily Score"] = ranked_table.apply(
+_daily_base["Daily Score"] = _daily_base.apply(
     lambda r: compute_daily_score(r, hourly_entries_df), axis=1
 )
-ranked_table = (
-    ranked_table
-    .drop(columns=["Latest Price"])
-    .sort_values("Daily Score", ascending=False)
-    .reset_index(drop=True)
-)
+_daily_base = _daily_base.rename(columns={"SwingHigh": "Swing High", "SwingLow": "Swing Low"})
+_daily_base = _daily_base.drop(columns=["Latest Price"])
 
-event = st.dataframe(
-    ranked_table,
+# Build hourly join columns
+if not ranked_hourly.empty:
+    _hourly_cols = [c for c in [
+        "Ticker", "FOCUS", "FOCUS_SCORE", "entry_618_hit",
+        "entry_618", "stop", "take_profit", "rr", "distance_to_entry_618_pct",
+    ] if c in ranked_hourly.columns]
+    _hourly_join = ranked_hourly[_hourly_cols].copy()
+    _hourly_join = _hourly_join.rename(columns={
+        "FOCUS":                     "Focus",
+        "FOCUS_SCORE":               "Focus Score",
+        "entry_618_hit":             "At Entry?",
+        "entry_618":                 "Entry 61.8%",
+        "stop":                      "Stop",
+        "take_profit":               "Target",
+        "rr":                        "R:R",
+        "distance_to_entry_618_pct": "Dist to Entry",
+    })
+    unified = _daily_base.merge(_hourly_join, on="Ticker", how="left")
+else:
+    unified = _daily_base.copy()
+    for _col in ["Focus", "Focus Score", "At Entry?", "Entry 61.8%", "Stop", "Target", "R:R", "Dist to Entry"]:
+        unified[_col] = np.nan
+
+# Sort by Daily Score descending
+unified = unified.sort_values("Daily Score", ascending=False).reset_index(drop=True)
+
+# Format display columns — NaN → blank string
+if "At Entry?" in unified.columns:
+    unified["At Entry?"] = unified["At Entry?"].map(
+        {True: "✅ YES", False: "", 1: "✅ YES", 0: ""}
+    ).fillna("")
+
+if "Dist to Entry" in unified.columns:
+    unified["Dist to Entry"] = unified["Dist to Entry"].apply(
+        lambda x: f"{x * 100:.2f}%" if pd.notna(x) else ""
+    )
+
+for _col in ["Focus", "Focus Score", "Entry 61.8%", "Stop", "Target", "R:R"]:
+    if _col in unified.columns:
+        unified[_col] = unified[_col].apply(
+            lambda x: x if isinstance(x, str) else ("" if pd.isna(x) else x)
+        )
+
+_col_order = [
+    "Ticker", "Daily Score", "Swing High", "Swing Low", "Retracement %",
+    "Focus", "Focus Score", "At Entry?", "Entry 61.8%", "Stop", "Target", "R:R", "Dist to Entry",
+]
+_col_order = [c for c in _col_order if c in unified.columns]
+unified_display = unified[_col_order]
+
+unified_event = st.dataframe(
+    unified_display,
     hide_index=True,
     use_container_width=True,
-    key="ranked_df",
+    key="unified_df",
     on_select="rerun",
     selection_mode="single-row",
 )
 
-selected_rows = []
-if event is not None:
-    if hasattr(event, "selection") and hasattr(event.selection, "rows"):
-        selected_rows = event.selection.rows
-    elif isinstance(event, dict):
-        selected_rows = event.get("selection", {}).get("rows", [])
+# Extract selected row index
+_unified_selected_rows = []
+if unified_event is not None:
+    if hasattr(unified_event, "selection") and hasattr(unified_event.selection, "rows"):
+        _unified_selected_rows = unified_event.selection.rows
+    elif isinstance(unified_event, dict):
+        _unified_selected_rows = unified_event.get("selection", {}).get("rows", [])
 
-if "selected_ticker" not in st.session_state:
-    st.session_state.selected_ticker = None
+if "unified_selected_ticker" not in st.session_state:
+    st.session_state.unified_selected_ticker = None
 
-if selected_rows:
-    idx = selected_rows[0]
-    if 0 <= idx < len(ranked_table):
-        st.session_state.selected_ticker = ranked_table.iloc[idx]["Ticker"]
+if _unified_selected_rows:
+    _idx = _unified_selected_rows[0]
+    if 0 <= _idx < len(unified):
+        st.session_state.unified_selected_ticker = unified.iloc[_idx]["Ticker"]
 
-ticker_selected = st.session_state.selected_ticker
+unified_ticker_selected = st.session_state.unified_selected_ticker
 
 
 # ==========================================================
@@ -533,43 +398,143 @@ def render_entry_card(hourly_row=None):
 
 
 # ==========================================================
-# TICKER DRILLDOWN
+# CHART PANEL — rendered below the unified table on row select
 # ==========================================================
-if ticker_selected:
-    sel_df = df_view[df_view["Ticker"] == ticker_selected]
+if unified_ticker_selected:
+    sel_df = df_view[df_view["Ticker"] == unified_ticker_selected]
     if sel_df.empty:
         st.warning("Selected ticker no longer available.")
         st.stop()
     row_sel = sel_df.iloc[0]
 
-    st.write(f"### 📌 {ticker_selected}")
+    st.write(f"### 📌 {unified_ticker_selected}")
 
-    swing_h = row_sel.get("SwingHigh", np.nan)
-    swing_l = row_sel.get("SwingLow",  np.nan)
-    latest  = row_sel.get("Latest Price", np.nan)
-    rng     = swing_h - swing_l if pd.notna(swing_h) and pd.notna(swing_l) else np.nan
-    retr_pct = (swing_h - latest) / rng * 100 if rng else np.nan
-
-    c1, c2, c3 = st.columns(3)
-    with c1: st.metric("Swing High",  f"{swing_h:.2f}" if pd.notna(swing_h) else "N/A")
-    with c2: st.metric("Swing Low",   f"{swing_l:.2f}" if pd.notna(swing_l) else "N/A")
-    with c3: st.metric("Retracement", f"{retr_pct:.1f}%" if pd.notna(retr_pct) else "N/A")
-
-    lookback_days = st.slider(
-        "Chart lookback (days)", 60, 500, 180, 10, key="daily_lookback_slider"
+    has_hourly = (
+        not ranked_hourly.empty
+        and unified_ticker_selected in ranked_hourly["Ticker"].values
     )
-    plot_ticker_chart(df_all, row_sel, lookback_days=lookback_days)
 
-    hourly_sel = None
-    if not ranked_hourly.empty:
-        hourly_sel = ranked_hourly[ranked_hourly["Ticker"] == ticker_selected]
-        if hourly_sel.empty:
-            hourly_sel = None
+    if has_hourly:
+        # --- Hourly candlestick chart with Fib lines ---
+        sel_row_df    = ranked_hourly[ranked_hourly["Ticker"] == unified_ticker_selected]
+        ticker_hourly = hourly_df[hourly_df["Ticker"] == unified_ticker_selected].copy()
 
-    render_entry_card(hourly_row=hourly_sel)
+        if not sel_row_df.empty and not ticker_hourly.empty:
+            hrow = sel_row_df.iloc[0]
+
+            ticker_hourly["DateTime"] = pd.to_datetime(
+                ticker_hourly["DateTime"], errors="coerce", utc=True
+            ).dt.tz_convert(None)
+            ticker_hourly = (
+                ticker_hourly.dropna(subset=["DateTime"])
+                .sort_values("DateTime")
+                .reset_index(drop=True)
+            )
+
+            high_dt = pd.to_datetime(hrow.get("local_high_time"),  errors="coerce", utc=True)
+            retr_dt = pd.to_datetime(hrow.get("DailyRetrLowDate"), errors="coerce", utc=True)
+            if pd.notna(high_dt): high_dt = high_dt.tz_convert(None)
+            if pd.notna(retr_dt): retr_dt = retr_dt.tz_convert(None)
+
+            max_dt    = ticker_hourly["DateTime"].max()
+            win_start = (high_dt - pd.Timedelta(hours=72)) if pd.notna(high_dt) else (max_dt - pd.Timedelta(hours=72))
+            if pd.notna(retr_dt):
+                win_start = min(retr_dt, win_start)
+            win_end = max_dt
+
+            visible = ticker_hourly[
+                (ticker_hourly["DateTime"] >= win_start) &
+                (ticker_hourly["DateTime"] <= win_end)
+            ]
+            if len(visible) < 50:
+                fallback = ticker_hourly.tail(240)
+                if not fallback.empty:
+                    win_start = fallback["DateTime"].min()
+                    win_end   = fallback["DateTime"].max()
+
+            # ----------------------------------------------------------
+            # Gap-free x-axis: each bar → sequential integer position.
+            # Non-trading hours / weekends simply have no bar, so there
+            # is no blank space — identical to Bloomberg / TradingView.
+            # DateTime labels are shown as formatted strings on the axis.
+            # ----------------------------------------------------------
+            n_bars   = len(ticker_hourly)
+            x_ints   = list(range(n_bars))
+            x_labels = ticker_hourly["DateTime"].dt.strftime("%b %d %H:%M").tolist()
+
+            # Convert datetime window → integer index range
+            win_mask = (
+                (ticker_hourly["DateTime"] >= win_start) &
+                (ticker_hourly["DateTime"] <= win_end)
+            )
+            win_idxs = ticker_hourly.index[win_mask].tolist()
+            if win_idxs:
+                idx_lo, idx_hi = win_idxs[0], win_idxs[-1]
+            else:
+                idx_lo, idx_hi = max(0, n_bars - 240), n_bars - 1
+
+            # ~8 evenly-spaced tick labels across the visible window
+            n_visible = max(idx_hi - idx_lo + 1, 1)
+            step = max(1, n_visible // 8)
+            tick_vals  = list(range(idx_lo, idx_hi + 1, step))
+            tick_texts = [x_labels[i] for i in tick_vals if i < n_bars]
+
+            st.markdown(
+                f"**{unified_ticker_selected}** &nbsp;|&nbsp; "
+                f"{hrow.get('FOCUS', '')} (Score: {hrow.get('FOCUS_SCORE', '—')})"
+            )
+
+            fig_h = go.Figure(data=[go.Candlestick(
+                x=x_ints,
+                open=ticker_hourly["Open"], high=ticker_hourly["High"],
+                low=ticker_hourly["Low"],   close=ticker_hourly["Close"],
+                name=unified_ticker_selected,
+            )])
+
+            for col, label, color in [
+                ("entry_382",   "Entry 38.2%", "#1f77b4"),
+                ("entry_50",    "Entry 50%",   "#9467bd"),
+                ("entry_618",   "Entry 61.8%", "#ff7f0e"),
+                ("stop",        "Stop",        "#d62728"),
+                ("take_profit", "Target",      "#2ca02c"),
+            ]:
+                val = hrow.get(col)
+                if val is not None and pd.notna(val):
+                    fig_h.add_hline(
+                        y=float(val), line_dash="dash", line_color=color,
+                        annotation_text=label, annotation_position="top left",
+                    )
+
+            fig_h.update_layout(
+                title=f"{unified_ticker_selected} — Hourly",
+                yaxis_title="Price",
+                xaxis_rangeslider_visible=False,
+                template="plotly_white", height=480,
+            )
+            fig_h.update_xaxes(
+                range=[idx_lo - 0.5, idx_hi + 0.5],
+                tickvals=tick_vals,
+                ticktext=tick_texts,
+            )
+
+            vis2 = ticker_hourly.iloc[idx_lo : idx_hi + 1]
+            if not vis2.empty:
+                y_lo = pd.to_numeric(vis2["Low"],  errors="coerce").min()
+                y_hi = pd.to_numeric(vis2["High"], errors="coerce").max()
+                if pd.notna(y_lo) and pd.notna(y_hi):
+                    pad = max((y_hi - y_lo) * 0.08, y_hi * 0.002)
+                    fig_h.update_yaxes(range=[y_lo - pad, y_hi + pad])
+
+            st.plotly_chart(fig_h, use_container_width=True)
+
+        render_entry_card(hourly_row=sel_row_df if not sel_row_df.empty else None)
+
+    else:
+        # --- Daily candlestick chart with Fib levels only ---
+        plot_ticker_chart(df_all, row_sel)
 
 else:
-    st.info("Select a row from the hourly candidates or daily watchlist to see charts and trade levels.")
+    st.info("Select a row from the table to see charts and trade levels.")
 
 
 # ==========================================================
